@@ -1,11 +1,11 @@
 require("dotenv").config();
-
 const express = require("express");
-const nodemailer = require("nodemailer");
 const cors = require("cors");
+const { Resend } = require("resend");
 
 const app = express();
 const port = 4000;
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
@@ -16,19 +16,13 @@ app.use((req, res, next) => {
   next();
 });
 
-function sendEmail({ email, subject, message, table, order1 }) {
-  return new Promise((resolve, reject) => {
-    const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-      },
-    });
+app.get("/", async (req, res) => {
+  const { email, subject, message, table, order1 } = req.query;
 
-    const mail_configs = {
-      from: "codetech1807@gmail.com",
-      to: [email, "codetech1807@gmail.com"],
+  try {
+    await resend.emails.send({
+      from: "FOODco <onboarding@resend.dev>",
+      to: [email, process.env.EMAIL_USER],
       subject: `${subject}'s Order`,
       html: `
         <h1>Order Summary</h1>
@@ -37,22 +31,12 @@ function sendEmail({ email, subject, message, table, order1 }) {
         <h2>Your order:</h2>
         <pre>${message}</pre>
       `,
-    };
-
-    transporter.sendMail(mail_configs, (error, info) => {
-      if (error) {
-        console.error(error);
-        return reject({ message: "An error occurred sending the email." });
-      }
-      return resolve({ message: "Email sent successfully" });
     });
-  });
-}
-
-app.get("/", (req, res) => {
-  sendEmail(req.query)
-    .then((response) => res.send(response.message))
-    .catch((error) => res.status(500).send(error.message));
+    res.send("Email sent successfully");
+  } catch (error) {
+    console.error(error);
+    res.status(500).send("An error occurred sending the email.");
+  }
 });
 
 app.listen(port, () => {
