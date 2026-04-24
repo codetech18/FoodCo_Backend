@@ -2,6 +2,13 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { Resend } = require("resend");
+const admin = require("firebase-admin");
+
+admin.initializeApp({
+  credential: admin.credential.cert(
+    JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT),
+  ),
+});
 
 const app = express();
 const port = 4000;
@@ -14,6 +21,25 @@ app.use(express.urlencoded({ limit: "25mb" }));
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   next();
+});
+
+// GET /banks — fetch supported Nigerian banks from Paystack (always up-to-date codes)
+app.get("/banks", async (req, res) => {
+  try {
+    const r = await fetch(
+      "https://api.paystack.co/bank?country=nigeria&type=nuban&currency=NGN&per_page=100",
+      { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } },
+    );
+    const data = await r.json();
+    if (data.status) {
+      const banks = data.data.map((b) => ({ name: b.name, code: b.code }));
+      return res.json(banks);
+    }
+    res.status(500).json({ error: "Failed to fetch banks" });
+  } catch (err) {
+    console.error("Banks fetch error:", err);
+    res.status(500).json({ error: "Request failed" });
+  }
 });
 
 // GET /resolve-account — verify a merchant's bank account number before creating subaccount
@@ -87,6 +113,22 @@ app.post("/verify-payment", async (req, res) => {
   } catch (err) {
     console.error("Paystack verify error:", err);
     return res.status(500).json({ success: false, error: "Verification request failed" });
+  }
+});
+
+// DELETE /delete-user — permanently delete a Firebase Auth account (admin only)
+app.delete("/delete-user", async (req, res) => {
+  if (req.headers["x-admin-key"] !== process.env.ADMIN_API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const { uid } = req.body;
+  if (!uid) return res.status(400).json({ error: "uid required" });
+  try {
+    await admin.auth().deleteUser(uid);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete user error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
