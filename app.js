@@ -23,69 +23,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ==================== PAYSTACK INITIATE (NEW) ====================
-// POST /initiate-payment – create a Paystack transaction and return access_code
-app.post("/initiate-payment", async (req, res) => {
-  try {
-    const { email, amount, subaccountCode, metadata } = req.body;
-
-    // Validate required fields
-    if (!email || !amount || !subaccountCode) {
-      return res.status(400).json({
-        error: "Missing required fields: email, amount, subaccountCode",
-      });
-    }
-    if (
-      !metadata?.restaurantId ||
-      !metadata?.table ||
-      !metadata?.customerName
-    ) {
-      return res.status(400).json({ error: "Missing metadata fields" });
-    }
-
-    // Call Paystack initialize API
-    const response = await fetch(
-      "https://api.paystack.co/transaction/initialize",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          email,
-          amount: Math.round(amount * 100), // Convert NGN to kobo
-          currency: "NGN",
-          metadata,
-          subaccount: subaccountCode,
-          transaction_charge: 0, // Adjust as needed
-          bearer: "subaccount", // Restaurant pays the Paystack fee
-        }),
-      },
-    );
-
-    const data = await response.json();
-
-    if (!data.status) {
-      console.error("Paystack init error:", data);
-      return res
-        .status(400)
-        .json({ error: data.message || "Payment initialization failed" });
-    }
-
-    // Return access_code to frontend
-    return res.json({
-      accessCode: data.data.access_code,
-      reference: data.data.reference,
-    });
-  } catch (err) {
-    console.error("Initiate payment error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// ==================== EXISTING ENDPOINTS ====================
-// GET /banks — fetch supported Nigerian banks from Paystack
+// GET /banks — fetch supported Nigerian banks from Paystack (always up-to-date codes)
 app.get("/banks", async (req, res) => {
   try {
     const r = await fetch(
@@ -138,9 +76,11 @@ app.get("/resolve-account", async (req, res) => {
 app.post("/create-subaccount", async (req, res) => {
   const { businessName, bankCode, accountNumber } = req.body;
   if (!businessName || !bankCode || !accountNumber) {
-    return res.status(400).json({
-      error: "businessName, bankCode, and accountNumber are required",
-    });
+    return res
+      .status(400)
+      .json({
+        error: "businessName, bankCode, and accountNumber are required",
+      });
   }
   try {
     const r = await fetch("https://api.paystack.co/subaccount", {
@@ -169,7 +109,6 @@ app.post("/create-subaccount", async (req, res) => {
   }
 });
 
-// POST /verify-payment — verify transaction reference
 app.post("/verify-payment", async (req, res) => {
   const { reference } = req.body;
   if (!reference || typeof reference !== "string") {
