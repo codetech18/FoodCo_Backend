@@ -23,63 +23,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ========== PAYSTACK INITIATE (NEW) ==========
-app.post("/initiate-payment", async (req, res) => {
-  try {
-    const { email, amount, subaccountCode, metadata } = req.body;
-
-    if (!email || !amount || !subaccountCode) {
-      return res.status(400).json({
-        error: "Missing required fields: email, amount, subaccountCode",
-      });
-    }
-    if (
-      !metadata?.restaurantId ||
-      !metadata?.table ||
-      !metadata?.customerName
-    ) {
-      return res.status(400).json({ error: "Missing metadata fields" });
-    }
-
-    const response = await fetch(
-      "https://api.paystack.co/transaction/initialize",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          email,
-          amount: Math.round(amount * 100),
-          currency: "NGN",
-          metadata,
-          subaccount: subaccountCode,
-          transaction_charge: 0,
-          bearer: "subaccount",
-        }),
-      },
-    );
-
-    const data = await response.json();
-    if (!data.status) {
-      console.error("Paystack init error:", data);
-      return res
-        .status(400)
-        .json({ error: data.message || "Payment initialization failed" });
-    }
-
-    return res.json({
-      accessCode: data.data.access_code,
-      reference: data.data.reference,
-    });
-  } catch (err) {
-    console.error("Initiate payment error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// ========== EXISTING ENDPOINTS ==========
+// GET /banks — fetch supported Nigerian banks from Paystack (always up-to-date codes)
 app.get("/banks", async (req, res) => {
   try {
     const r = await fetch(
@@ -100,6 +44,7 @@ app.get("/banks", async (req, res) => {
   }
 });
 
+// GET /resolve-account — verify a merchant's bank account number before creating subaccount
 app.get("/resolve-account", async (req, res) => {
   const { account_number, bank_code } = req.query;
   if (!account_number || !bank_code) {
@@ -127,6 +72,7 @@ app.get("/resolve-account", async (req, res) => {
   }
 });
 
+// POST /create-subaccount — register merchant bank account as a Paystack subaccount
 app.post("/create-subaccount", async (req, res) => {
   const { businessName, bankCode, accountNumber } = req.body;
   if (!businessName || !bankCode || !accountNumber) {
@@ -188,6 +134,7 @@ app.post("/verify-payment", async (req, res) => {
   }
 });
 
+// DELETE /delete-user — permanently delete a Firebase Auth account (admin only)
 app.delete("/delete-user", async (req, res) => {
   if (req.headers["x-admin-key"] !== process.env.ADMIN_API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -203,6 +150,7 @@ app.delete("/delete-user", async (req, res) => {
   }
 });
 
+// POST /send-receipt — email the full bill to the customer(s) when the table is closed
 app.post("/send-receipt", async (req, res) => {
   const { emails, restaurantName, table, orders, totalBill } = req.body;
   if (!emails?.length) {
@@ -268,6 +216,7 @@ app.post("/send-receipt", async (req, res) => {
 
 app.get("/", async (req, res) => {
   const { email, subject, message, table, order1 } = req.query;
+
   try {
     await resend.emails.send({
       from: "FOODco <onboarding@resend.dev>",
