@@ -7,7 +7,9 @@ const admin = require("firebase-admin");
 
 admin.initializeApp({
   credential: admin.credential.cert(
-    JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT),
+    JSON.parse(
+      (process.env.FIREBASE_SERVICE_ACCOUNT || "").replace(/\\n/g, "\n"),
+    ),
   ),
 });
 
@@ -39,7 +41,8 @@ const slugify = (name) =>
 
 const isExpiredTimestamp = (value) => {
   if (!value) return false;
-  const expiry = typeof value.toDate === "function" ? value.toDate() : new Date(value);
+  const expiry =
+    typeof value.toDate === "function" ? value.toDate() : new Date(value);
   return Number.isFinite(expiry.getTime()) && new Date() > expiry;
 };
 
@@ -119,10 +122,14 @@ app.post("/complete-signup", requireFirebaseUser, async (req, res) => {
   const selectedPaymentMode = normalizePaymentMode(paymentMode);
 
   if (!inviteCode || !name || !restaurantId || !email) {
-    return res.status(400).json({ error: "Invite code, restaurant name, and email are required." });
+    return res
+      .status(400)
+      .json({ error: "Invite code, restaurant name, and email are required." });
   }
   if (!address || !phone || !contactEmail) {
-    return res.status(400).json({ error: "Address, phone, and contact email are required." });
+    return res
+      .status(400)
+      .json({ error: "Address, phone, and contact email are required." });
   }
 
   try {
@@ -142,19 +149,31 @@ app.post("/complete-signup", requireFirebaseUser, async (req, res) => {
       ]);
 
       if (userSnap.exists) {
-        throw Object.assign(new Error("This user already has a restaurant workspace."), { statusCode: 409 });
+        throw Object.assign(
+          new Error("This user already has a restaurant workspace."),
+          { statusCode: 409 },
+        );
       }
       if (profileSnap.exists) {
-        throw Object.assign(new Error("This restaurant URL is already taken. Please adjust the name."), { statusCode: 409 });
+        throw Object.assign(
+          new Error(
+            "This restaurant URL is already taken. Please adjust the name.",
+          ),
+          { statusCode: 409 },
+        );
       }
       if (inviteSnap.empty) {
-        throw Object.assign(new Error("Invalid or already used invite code."), { statusCode: 400 });
+        throw Object.assign(new Error("Invalid or already used invite code."), {
+          statusCode: 400,
+        });
       }
 
       const inviteDoc = inviteSnap.docs[0];
       const inviteData = inviteDoc.data();
       if (isExpiredTimestamp(inviteData.expiresAt)) {
-        throw Object.assign(new Error("This invite code has expired."), { statusCode: 400 });
+        throw Object.assign(new Error("This invite code has expired."), {
+          statusCode: 400,
+        });
       }
 
       const trialEndsAt = new Date();
@@ -390,19 +409,36 @@ app.post("/finalize-online-payment", async (req, res) => {
       }))
     : [];
 
-  if (!cleanedReference || !cleanedRestaurantId || !cleanedTable || !cleanedName) {
-    return res.status(400).json({ success: false, error: "Missing payment or order details." });
+  if (
+    !cleanedReference ||
+    !cleanedRestaurantId ||
+    !cleanedTable ||
+    !cleanedName
+  ) {
+    return res
+      .status(400)
+      .json({ success: false, error: "Missing payment or order details." });
   }
-  if (!Number.isFinite(numericTotal) || numericTotal <= 0 || expectedAmount <= 0) {
-    return res.status(400).json({ success: false, error: "Invalid order total." });
+  if (
+    !Number.isFinite(numericTotal) ||
+    numericTotal <= 0 ||
+    expectedAmount <= 0
+  ) {
+    return res
+      .status(400)
+      .json({ success: false, error: "Invalid order total." });
   }
   if (!validateOrderItems(cleanedItems)) {
-    return res.status(400).json({ success: false, error: "Invalid order items." });
+    return res
+      .status(400)
+      .json({ success: false, error: "Invalid order items." });
   }
 
   const calculatedTotal = calculateItemsTotal(cleanedItems);
   if (Math.round(calculatedTotal * 100) !== expectedAmount) {
-    return res.status(400).json({ success: false, error: "Order total does not match items." });
+    return res
+      .status(400)
+      .json({ success: false, error: "Order total does not match items." });
   }
 
   try {
@@ -410,42 +446,71 @@ app.post("/finalize-online-payment", async (req, res) => {
     const metadata = transaction.metadata || {};
 
     if (Number(transaction.amount) !== expectedAmount) {
-      return res.status(400).json({ success: false, error: "Payment amount does not match order total." });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          error: "Payment amount does not match order total.",
+        });
     }
     if (transaction.currency !== "NGN") {
-      return res.status(400).json({ success: false, error: "Unsupported payment currency." });
+      return res
+        .status(400)
+        .json({ success: false, error: "Unsupported payment currency." });
     }
-    if (metadata.restaurantId && metadata.restaurantId !== cleanedRestaurantId) {
-      return res.status(400).json({ success: false, error: "Payment restaurant mismatch." });
+    if (
+      metadata.restaurantId &&
+      metadata.restaurantId !== cleanedRestaurantId
+    ) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Payment restaurant mismatch." });
     }
     if (metadata.table && String(metadata.table) !== cleanedTable) {
-      return res.status(400).json({ success: false, error: "Payment table mismatch." });
+      return res
+        .status(400)
+        .json({ success: false, error: "Payment table mismatch." });
     }
 
     const result = await db.runTransaction(async (tx) => {
-      const profileRef = db.doc(`restaurants/${cleanedRestaurantId}/profile/info`);
+      const profileRef = db.doc(
+        `restaurants/${cleanedRestaurantId}/profile/info`,
+      );
       const paymentRef = db.doc(`paymentReferences/${cleanedReference}`);
       const profileSnap = await tx.get(profileRef);
       const paymentSnap = await tx.get(paymentRef);
 
       if (!profileSnap.exists) {
-        throw Object.assign(new Error("Restaurant not found."), { statusCode: 404 });
+        throw Object.assign(new Error("Restaurant not found."), {
+          statusCode: 404,
+        });
       }
 
       const profile = profileSnap.data();
       if (normalizePaymentMode(profile.paymentMode) !== "pay_online") {
-        throw Object.assign(new Error("Online payment is not enabled for this restaurant."), { statusCode: 403 });
+        throw Object.assign(
+          new Error("Online payment is not enabled for this restaurant."),
+          { statusCode: 403 },
+        );
       }
       if (!profile.paystackSubaccountCode) {
-        throw Object.assign(new Error("Online payment account is not connected."), { statusCode: 400 });
+        throw Object.assign(
+          new Error("Online payment account is not connected."),
+          { statusCode: 400 },
+        );
       }
 
       const transactionSubaccount =
         transaction.subaccount?.subaccount_code ||
         transaction.subaccount_code ||
         null;
-      if (transactionSubaccount && transactionSubaccount !== profile.paystackSubaccountCode) {
-        throw Object.assign(new Error("Payment account mismatch."), { statusCode: 400 });
+      if (
+        transactionSubaccount &&
+        transactionSubaccount !== profile.paystackSubaccountCode
+      ) {
+        throw Object.assign(new Error("Payment account mismatch."), {
+          statusCode: 400,
+        });
       }
 
       if (paymentSnap.exists && paymentSnap.data().orderId) {
@@ -456,25 +521,37 @@ app.post("/finalize-online-payment", async (req, res) => {
         };
       }
 
-      const orderRef = db.collection(`restaurants/${cleanedRestaurantId}/orders`).doc();
+      const orderRef = db
+        .collection(`restaurants/${cleanedRestaurantId}/orders`)
+        .doc();
       let sessionRef;
       let existingOrderIds = [];
       let nextTotalBill = numericTotal;
 
       if (sessionId) {
-        sessionRef = db.doc(`restaurants/${cleanedRestaurantId}/tableSessions/${sessionId}`);
+        sessionRef = db.doc(
+          `restaurants/${cleanedRestaurantId}/tableSessions/${sessionId}`,
+        );
         const sessionSnap = await tx.get(sessionRef);
         if (!sessionSnap.exists) {
-          throw Object.assign(new Error("Table session not found."), { statusCode: 404 });
+          throw Object.assign(new Error("Table session not found."), {
+            statusCode: 404,
+          });
         }
         const session = sessionSnap.data();
         if (String(session.table) !== cleanedTable) {
-          throw Object.assign(new Error("Table session mismatch."), { statusCode: 400 });
+          throw Object.assign(new Error("Table session mismatch."), {
+            statusCode: 400,
+          });
         }
-        existingOrderIds = Array.isArray(session.orderIds) ? session.orderIds : [];
+        existingOrderIds = Array.isArray(session.orderIds)
+          ? session.orderIds
+          : [];
         nextTotalBill = Number(session.totalBill || 0) + numericTotal;
       } else {
-        sessionRef = db.collection(`restaurants/${cleanedRestaurantId}/tableSessions`).doc();
+        sessionRef = db
+          .collection(`restaurants/${cleanedRestaurantId}/tableSessions`)
+          .doc();
       }
 
       tx.set(orderRef, {
