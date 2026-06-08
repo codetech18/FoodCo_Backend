@@ -5,12 +5,21 @@ const crypto = require("crypto");
 const { Resend } = require("resend");
 const admin = require("firebase-admin");
 
+//admin.initializeApp({
+//  credential: admin.credential.cert(
+//    JSON.parse(
+//      (process.env.FIREBASE_SERVICE_ACCOUNT || "").replace(/\\n/g, "\n"),
+//    ),
+//  ),
+//});
+
+let firebaseConfig = process.env.FIREBASE_SERVICE_ACCOUNT || "";
+
+// Remove all whitespace newlines and tabs, but preserve \n as literal characters
+firebaseConfig = firebaseConfig.replace(/\s+/g, " ").trim();
+
 admin.initializeApp({
-  credential: admin.credential.cert(
-    JSON.parse(
-      (process.env.FIREBASE_SERVICE_ACCOUNT || "").replace(/\\n/g, "\n"),
-    ),
-  ),
+  credential: admin.credential.cert(JSON.parse(firebaseConfig)),
 });
 
 const app = express();
@@ -446,12 +455,10 @@ app.post("/finalize-online-payment", async (req, res) => {
     const metadata = transaction.metadata || {};
 
     if (Number(transaction.amount) !== expectedAmount) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          error: "Payment amount does not match order total.",
-        });
+      return res.status(400).json({
+        success: false,
+        error: "Payment amount does not match order total.",
+      });
     }
     if (transaction.currency !== "NGN") {
       return res
