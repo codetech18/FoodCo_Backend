@@ -109,6 +109,121 @@ const verifyPaystackReference = async (reference) => {
   return data.data;
 };
 
+const sendWelcomeEmail = async (restaurantName, email, slug) => {
+  const loginUrl = `https://servrr.ng/login`;
+  const menuUrl = `https://servrr.ng/${slug}`;
+
+  const html = `
+  <div style="background:#0f0a07;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:560px;margin:0 auto;padding:0;border-radius:12px;overflow:hidden;">
+    <div style="background:#0f0a07;padding:36px 40px 28px;border-bottom:3px solid #fa5631;">
+      <div style="margin-bottom:24px;">
+        <span style="color:#ffffff;font-size:22px;font-weight:900;letter-spacing:-0.5px;border-left:6px solid #fa5631;padding-left:12px;">SERVRR</span>
+      </div>
+      <h1 style="color:#ffffff;font-size:28px;font-weight:900;margin:0 0 8px 0;line-height:1.2;">
+        Welcome to Servrr,<br/>
+        <span style="color:#fa5631;">${restaurantName}.</span>
+      </h1>
+      <p style="color:#888888;font-size:14px;margin:0;">
+        Your digital ordering system is ready. Let's get you live.
+      </p>
+    </div>
+
+    <div style="background:#111111;padding:36px 40px;">
+      <p style="color:#cccccc;font-size:15px;line-height:1.7;margin:0 0 28px 0;">
+        Your Servrr dashboard has been created. You're on a 
+        <strong style="color:#fa5631;">7-day free trial</strong> with full access 
+        to everything — no card required.
+      </p>
+
+      <p style="color:#666666;font-size:11px;font-weight:800;letter-spacing:0.15em;text-transform:uppercase;margin:0 0 16px 0;">
+        Get started in 4 steps
+      </p>
+
+      <div style="margin-bottom:20px;display:flex;gap:16px;align-items:flex-start;">
+        <div style="min-width:32px;height:32px;background:#fa563120;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;border:1px solid #fa563140;">
+          <span style="color:#fa5631;font-size:10px;font-weight:900;">01</span>
+        </div>
+        <div>
+          <p style="color:#ffffff;font-size:14px;font-weight:700;margin:0 0 4px 0;">Verify your email</p>
+          <p style="color:#666666;font-size:13px;margin:0;line-height:1.5;">Click the verification link we just sent to activate your account.</p>
+        </div>
+      </div>
+
+      <div style="margin-bottom:20px;display:flex;gap:16px;align-items:flex-start;">
+        <div style="min-width:32px;height:32px;background:#fa563120;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;border:1px solid #fa563140;">
+          <span style="color:#fa5631;font-size:10px;font-weight:900;">02</span>
+        </div>
+        <div>
+          <p style="color:#ffffff;font-size:14px;font-weight:700;margin:0 0 4px 0;">Log in to your dashboard</p>
+          <p style="color:#666666;font-size:13px;margin:0;line-height:1.5;">Use your email and password to access your admin panel.</p>
+        </div>
+      </div>
+
+      <div style="margin-bottom:20px;display:flex;gap:16px;align-items:flex-start;">
+        <div style="min-width:32px;height:32px;background:#fa563120;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;border:1px solid #fa563140;">
+          <span style="color:#fa5631;font-size:10px;font-weight:900;">03</span>
+        </div>
+        <div>
+          <p style="color:#ffffff;font-size:14px;font-weight:700;margin:0 0 4px 0;">Build your menu</p>
+          <p style="color:#666666;font-size:13px;margin:0;line-height:1.5;">Add your dishes, prices, categories, and photos.</p>
+        </div>
+      </div>
+
+      <div style="margin-bottom:28px;display:flex;gap:16px;align-items:flex-start;">
+        <div style="min-width:32px;height:32px;background:#fa563120;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;border:1px solid #fa563140;">
+          <span style="color:#fa5631;font-size:10px;font-weight:900;">04</span>
+        </div>
+        <div>
+          <p style="color:#ffffff;font-size:14px;font-weight:700;margin:0 0 4px 0;">Print your QR codes</p>
+          <p style="color:#666666;font-size:13px;margin:0;line-height:1.5;">Generate a QR code per table, place them out. You're live.</p>
+        </div>
+      </div>
+
+      <div style="text-align:center;margin:32px 0;">
+        <a href="${loginUrl}" style="display:inline-block;background:#fa5631;color:#0f0a07;font-size:12px;font-weight:900;letter-spacing:0.12em;text-transform:uppercase;padding:16px 40px;border-radius:100px;text-decoration:none;">
+          Go to Dashboard →
+        </a>
+      </div>
+
+      <div style="border-top:1px solid #222222;margin:28px 0;"></div>
+
+      <div style="background:#0f0a07;border:1px solid #222222;border-radius:8px;padding:16px 20px;margin-bottom:12px;">
+        <p style="color:#444444;font-size:10px;font-weight:800;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 6px 0;">Your menu link</p>
+        <a href="${menuUrl}" style="color:#fa5631;font-size:13px;font-weight:600;text-decoration:none;">${menuUrl}</a>
+        <p style="color:#555555;font-size:12px;margin:6px 0 0 0;">Share this with customers or use it to preview your menu.</p>
+      </div>
+
+      <div style="background:#0f0a07;border:1px solid #222222;border-radius:8px;padding:16px 20px;">
+        <p style="color:#444444;font-size:10px;font-weight:800;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 6px 0;">Trial ends in</p>
+        <p style="color:#ffffff;font-size:13px;font-weight:700;margin:0;">7 days — no payment needed until then.</p>
+        <p style="color:#555555;font-size:12px;margin:6px 0 0 0;">After your trial, plans start at ₦20,000/month. We'll remind you before it ends.</p>
+      </div>
+
+      <div style="border-top:1px solid #222222;margin:28px 0;"></div>
+
+      <p style="color:#555555;font-size:13px;line-height:1.7;margin:0;">
+        Need help? Reply to this email or reach us at 
+        <a href="mailto:support@servrr.ng" style="color:#fa5631;text-decoration:none;">support@servrr.ng</a>. 
+        I personally read every message.
+      </p>
+      <p style="color:#555555;font-size:13px;margin:16px 0 0 0;">— Akorede, Founder of Servrr</p>
+    </div>
+
+    <div style="background:#0a0a0a;padding:20px 40px;border-top:1px solid #1a1a1a;">
+      <p style="color:#333333;font-size:11px;text-align:center;margin:0;">
+        Servrr · Lagos, Nigeria · <a href="https://servrr.ng" style="color:#444444;text-decoration:none;">servrr.ng</a>
+      </p>
+    </div>
+  </div>`;
+
+  await resend.emails.send({
+    from: "Akorede at Servrr <onboarding@resend.dev>",
+    to: email,
+    subject: `Welcome to Servrr, ${restaurantName} 🎉`,
+    html,
+  });
+};
+
 app.post("/complete-signup", requireFirebaseUser, async (req, res) => {
   const {
     inviteCode,
@@ -227,6 +342,11 @@ app.post("/complete-signup", requireFirebaseUser, async (req, res) => {
 
       return { restaurantId };
     });
+
+    // Fire welcome email — non-blocking
+    sendWelcomeEmail(name, email, result.restaurantId).catch((err) =>
+      console.error("Welcome email failed:", err.message),
+    );
 
     return res.json({ success: true, ...result });
   } catch (err) {
