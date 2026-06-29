@@ -146,7 +146,7 @@ const requireFirebaseUser = async (req, res, next) => {
 // Mirrors isSuperAdmin/ownsRestaurantProfile/hasRestaurantRole in Functions/firestore.rules —
 // Admin SDK calls bypass rules, so staff-only routes re-check the same access model here.
 const SUPER_ADMIN_UID = "vqjNAPsGMyUjVL7PMIg3cBNSQhS2";
-const OPS_ROLES = ["owner", "manager", "admin", "kitchen", "bar", "waiter", "cashier"];
+const OPS_ROLES = ["owner", "manager", "admin", "staff", "kitchen", "bar", "waiter", "cashier"];
 const MANAGE_ROLES = ["owner", "manager", "admin"];
 
 // Escape user-supplied strings before interpolating into HTML emails.
