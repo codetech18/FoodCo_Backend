@@ -28,14 +28,64 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 const db = admin.firestore();
 const { FieldValue } = admin.firestore;
 
-app.use(cors());
+// Behind Render's proxy — needed for req.ip (rate limiting) to be the real client IP.
+app.set("trust proxy", 1);
+
+// ── CORS ───────────────────────────────────────────────────────────────────────
+// Set ALLOWED_ORIGINS (comma-separated) in the environment to lock the API to your
+// real frontend origins. If unset, falls back to permissive (logged) so nothing breaks.
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+if (ALLOWED_ORIGINS.length === 0) {
+  console.warn(
+    "[cors] ALLOWED_ORIGINS not set — allowing all origins. Set it to lock down CORS in production.",
+  );
+}
+
+app.use(
+  cors({
+    origin(origin, cb) {
+      // Non-browser / same-origin requests (no Origin header) are always allowed.
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("Not allowed by CORS"));
+    },
+  }),
+);
+
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ limit: "25mb" }));
 
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  next();
-});
+// ── Rate limiting ──────────────────────────────────────────────────────────────
+// Lightweight in-memory fixed-window limiter (sufficient for a single instance;
+// use a shared store like Redis if the backend is ever horizontally scaled).
+const rateBuckets = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of rateBuckets) if (now > b.reset) rateBuckets.delete(k);
+}, 60_000).unref?.();
+
+const rateLimit = ({ windowMs, max }) => (req, res, next) => {
+  const key = `${req.method} ${req.path}:${req.ip}`;
+  const now = Date.now();
+  let bucket = rateBuckets.get(key);
+  if (!bucket || now > bucket.reset) {
+    bucket = { count: 0, reset: now + windowMs };
+    rateBuckets.set(key, bucket);
+  }
+  bucket.count += 1;
+  if (bucket.count > max) {
+    res.setHeader("Retry-After", String(Math.ceil((bucket.reset - now) / 1000)));
+    return res
+      .status(429)
+      .json({ error: "Too many requests. Please slow down and try again shortly." });
+  }
+  return next();
+};
 
 const normalizePaymentMode = (mode) =>
   mode === "pay_online" || mode === "online" ? "pay_online" : "at_table";
@@ -73,9 +123,26 @@ const requireFirebaseUser = async (req, res, next) => {
 // Admin SDK calls bypass rules, so staff-only routes re-check the same access model here.
 const SUPER_ADMIN_UID = "vqjNAPsGMyUjVL7PMIg3cBNSQhS2";
 const OPS_ROLES = ["owner", "manager", "admin", "kitchen", "bar", "waiter", "cashier"];
+const MANAGE_ROLES = ["owner", "manager", "admin"];
 
-const userCanOperate = async (uid, restaurantId) => {
+// Escape user-supplied strings before interpolating into HTML emails.
+const escapeHtml = (value) =>
+  String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+// Mirrors isSuperAdmin in firestore.rules — the hardcoded UID OR a users doc with role "superadmin".
+const isSuperAdmin = async (uid) => {
   if (uid === SUPER_ADMIN_UID) return true;
+  const snap = await db.doc(`users/${uid}`).get();
+  return snap.exists && snap.data().role === "superadmin";
+};
+
+const hasRestaurantAccess = async (uid, restaurantId, roles) => {
+  if (await isSuperAdmin(uid)) return true;
 
   const profileSnap = await db.doc(`restaurants/${restaurantId}/profile/info`).get();
   if (profileSnap.exists && profileSnap.data().ownerUid === uid) return true;
@@ -83,8 +150,16 @@ const userCanOperate = async (uid, restaurantId) => {
   const userSnap = await db.doc(`users/${uid}`).get();
   if (!userSnap.exists) return false;
   const userData = userSnap.data();
-  return userData.restaurantId === restaurantId && OPS_ROLES.includes(userData.role);
+  return userData.restaurantId === restaurantId && roles.includes(userData.role);
 };
+
+// Any operational staff (mirrors canViewRestaurantOps).
+const userCanOperate = (uid, restaurantId) =>
+  hasRestaurantAccess(uid, restaurantId, OPS_ROLES);
+
+// Management only (mirrors canManageRestaurant) — owner/manager/admin.
+const userCanManage = (uid, restaurantId) =>
+  hasRestaurantAccess(uid, restaurantId, MANAGE_ROLES);
 
 const validateOrderItems = (items) => {
   if (!Array.isArray(items) || items.length === 0 || items.length > 100) {
@@ -126,10 +201,11 @@ const verifyPaystackReference = async (reference) => {
   return data.data;
 };
 
-app.post("/complete-signup", requireFirebaseUser, async (req, res) => {
+app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requireFirebaseUser, async (req, res) => {
   const {
     inviteCode,
     name,
+    businessType,
     paymentMode,
     accentColor,
     tagline,
@@ -146,6 +222,9 @@ app.post("/complete-signup", requireFirebaseUser, async (req, res) => {
   const uid = req.firebaseUser.uid;
   const restaurantId = slugify(name);
   const selectedPaymentMode = normalizePaymentMode(paymentMode);
+  // Only restaurant/lounge are sellable today; anything else (incl. "hotel") falls back to restaurant.
+  const selectedBusinessType =
+    businessType === "lounge" ? "lounge" : "restaurant";
 
   if (!inviteCode || !name || !restaurantId || !email) {
     return res
@@ -217,6 +296,7 @@ app.post("/complete-signup", requireFirebaseUser, async (req, res) => {
         ownerUid: uid,
         name: String(name).trim(),
         email,
+        businessType: selectedBusinessType,
         accentColor: accentColor || "#fa5631",
         tagline: tagline || "",
         description: description || "",
@@ -276,13 +356,20 @@ app.get("/banks", async (req, res) => {
   }
 });
 
-// GET /resolve-account — verify a merchant's bank account number before creating subaccount
-app.get("/resolve-account", async (req, res) => {
-  const { account_number, bank_code } = req.query;
+// GET /resolve-account — verify a merchant's bank account number before creating subaccount (management only)
+app.get("/resolve-account", rateLimit({ windowMs: 60_000, max: 30 }), requireFirebaseUser, async (req, res) => {
+  const { account_number, bank_code, restaurantId } = req.query;
+  const cleanedRestaurantId = String(restaurantId || "").trim();
   if (!account_number || !bank_code) {
     return res
       .status(400)
       .json({ error: "account_number and bank_code are required" });
+  }
+  if (!cleanedRestaurantId) {
+    return res.status(400).json({ error: "restaurantId is required" });
+  }
+  if (!(await userCanManage(req.firebaseUser.uid, cleanedRestaurantId))) {
+    return res.status(403).json({ error: "Not authorized for this restaurant" });
   }
   try {
     const r = await fetch(
@@ -304,13 +391,20 @@ app.get("/resolve-account", async (req, res) => {
   }
 });
 
-// POST /create-subaccount — register merchant bank account as a Paystack subaccount
-app.post("/create-subaccount", async (req, res) => {
-  const { businessName, bankCode, accountNumber } = req.body;
+// POST /create-subaccount — register merchant bank account as a Paystack subaccount (management only)
+app.post("/create-subaccount", rateLimit({ windowMs: 60_000, max: 10 }), requireFirebaseUser, async (req, res) => {
+  const { businessName, bankCode, accountNumber, restaurantId } = req.body;
+  const cleanedRestaurantId = String(restaurantId || "").trim();
   if (!businessName || !bankCode || !accountNumber) {
     return res.status(400).json({
       error: "businessName, bankCode, and accountNumber are required",
     });
+  }
+  if (!cleanedRestaurantId) {
+    return res.status(400).json({ error: "restaurantId is required" });
+  }
+  if (!(await userCanManage(req.firebaseUser.uid, cleanedRestaurantId))) {
+    return res.status(403).json({ error: "Not authorized for this restaurant" });
   }
   try {
     const r = await fetch("https://api.paystack.co/subaccount", {
@@ -451,7 +545,7 @@ app.get("/table-token", requireFirebaseUser, async (req, res) => {
 });
 
 // POST /open-table-session — validate the permanent QR token and open/rejoin a session (public, QR scan)
-app.post("/open-table-session", async (req, res) => {
+app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) => {
   const restaurantId = String(req.body?.restaurantId || "").trim();
   const table = String(req.body?.table || "").trim();
   const token = String(req.body?.token || "").trim();
@@ -640,7 +734,7 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
   }
 });
 
-app.post("/finalize-online-payment", async (req, res) => {
+app.post("/finalize-online-payment", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
   const {
     reference,
     restaurantId,
@@ -873,10 +967,10 @@ app.post("/finalize-online-payment", async (req, res) => {
   }
 });
 
-// DELETE /delete-user — permanently delete a Firebase Auth account (admin only)
-app.delete("/delete-user", async (req, res) => {
-  if (req.headers["x-admin-key"] !== process.env.ADMIN_API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
+// DELETE /delete-user — permanently delete a Firebase Auth account (super admin only)
+app.delete("/delete-user", requireFirebaseUser, async (req, res) => {
+  if (!(await isSuperAdmin(req.firebaseUser.uid))) {
+    return res.status(403).json({ error: "Forbidden" });
   }
   const { uid } = req.body;
   if (!uid) return res.status(400).json({ error: "uid required" });
@@ -889,27 +983,35 @@ app.delete("/delete-user", async (req, res) => {
   }
 });
 
-// POST /send-receipt — email the full bill to the customer(s) when the table is closed
-app.post("/send-receipt", async (req, res) => {
-  const { emails, restaurantName, table, orders, totalBill } = req.body;
-  if (!emails?.length) {
+// POST /send-receipt — email the full bill to the customer(s) when the table is closed (staff only)
+app.post("/send-receipt", rateLimit({ windowMs: 60_000, max: 20 }), requireFirebaseUser, async (req, res) => {
+  const { restaurantId, emails, restaurantName, table, orders, totalBill } = req.body;
+  const cleanedRestaurantId = String(restaurantId || "").trim();
+  if (!cleanedRestaurantId) {
+    return res.status(400).json({ error: "restaurantId is required" });
+  }
+  if (!Array.isArray(emails) || !emails.length) {
     return res.status(400).json({ error: "No email addresses provided" });
   }
+  if (!(await userCanOperate(req.firebaseUser.uid, cleanedRestaurantId))) {
+    return res.status(403).json({ error: "Not authorized for this restaurant" });
+  }
 
-  const itemsHtml = orders
+  const safeOrders = Array.isArray(orders) ? orders : [];
+  const itemsHtml = safeOrders
     .map((order) => {
       const rows = (order.items || [])
         .map(
           (item) => `
         <tr>
-          <td style="padding:6px 0;color:#aaa;font-size:13px;">${item.qty}× ${item.name}</td>
-          <td style="padding:6px 0;text-align:right;color:#aaa;font-size:13px;">₦${(parseFloat(item.price) * item.qty).toLocaleString()}</td>
+          <td style="padding:6px 0;color:#aaa;font-size:13px;">${Number(item.qty) || 0}× ${escapeHtml(item.name)}</td>
+          <td style="padding:6px 0;text-align:right;color:#aaa;font-size:13px;">₦${(parseFloat(item.price) * Number(item.qty) || 0).toLocaleString()}</td>
         </tr>`,
         )
         .join("");
       const header =
-        orders.length > 1
-          ? `<p style="color:#666;font-size:11px;margin:0 0 8px 0;text-transform:uppercase;letter-spacing:1px;">${order.customerName}'s order</p>`
+        safeOrders.length > 1
+          ? `<p style="color:#666;font-size:11px;margin:0 0 8px 0;text-transform:uppercase;letter-spacing:1px;">${escapeHtml(order.customerName)}'s order</p>`
           : "";
       return `
       <div style="margin-bottom:16px;">
@@ -929,8 +1031,8 @@ app.post("/send-receipt", async (req, res) => {
 
   const html = `
     <div style="background:#0a0a0a;font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;">
-      <h1 style="color:#fff;font-size:22px;font-weight:900;margin:0 0 4px 0;">${restaurantName}</h1>
-      <p style="color:#555;font-size:13px;margin:0 0 32px 0;">Table ${table} · Receipt</p>
+      <h1 style="color:#fff;font-size:22px;font-weight:900;margin:0 0 4px 0;">${escapeHtml(restaurantName)}</h1>
+      <p style="color:#555;font-size:13px;margin:0 0 32px 0;">Table ${escapeHtml(table)} · Receipt</p>
       <div style="background:#111;border:1px solid #222;padding:20px;margin-bottom:16px;">${itemsHtml}</div>
       <div style="background:#111;border:1px solid #333;padding:16px 20px;display:flex;justify-content:space-between;align-items:center;">
         <span style="color:#666;font-size:14px;text-transform:uppercase;letter-spacing:1px;">Total</span>
@@ -953,28 +1055,8 @@ app.post("/send-receipt", async (req, res) => {
   }
 });
 
-app.get("/", async (req, res) => {
-  const { email, subject, message, table, order1 } = req.query;
-
-  try {
-    await resend.emails.send({
-      from: "FOODco <onboarding@resend.dev>",
-      to: [email, process.env.EMAIL_USER],
-      subject: `${subject}'s Order`,
-      html: `
-        <h1>Order Summary</h1>
-        <p><strong>Table number:</strong> ${table}</p>
-        <p><strong>Allergies / notes:</strong> ${order1}</p>
-        <h2>Your order:</h2>
-        <pre>${message}</pre>
-      `,
-    });
-    res.send("Email sent successfully");
-  } catch (error) {
-    console.error(error);
-    res.status(500).send("An error occurred sending the email.");
-  }
-});
+// Lightweight health check (replaces the old unauthenticated email relay).
+app.get("/", (req, res) => res.json({ status: "ok" }));
 
 app.listen(port, () => {
   console.log(`Server listening at http://localhost:${port}`);
