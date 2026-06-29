@@ -105,6 +105,30 @@ const isExpiredTimestamp = (value) => {
   return Number.isFinite(expiry.getTime()) && new Date() > expiry;
 };
 
+const toMillis = (ts) => {
+  if (!ts) return 0;
+  if (typeof ts.toDate === "function") return ts.toDate().getTime();
+  if (ts.seconds) return ts.seconds * 1000;
+  const d = new Date(ts).getTime();
+  return Number.isFinite(d) ? d : 0;
+};
+
+// Whether a venue may currently take orders — mirrors the client gating in
+// RestaurantContext so a lapsed/suspended venue can't be ordered from via the API.
+const isVenueActive = (profile) => {
+  if (!profile) return false;
+  if (profile.suspended === true) return false;
+  // Legacy venues created before the subscription system are grandfathered active.
+  const hasSubFields =
+    profile.trialEndsAt ||
+    profile.subscriptionPaidUntil ||
+    profile.plan ||
+    profile.businessType;
+  if (!hasSubFields) return true;
+  const now = Date.now();
+  return now < toMillis(profile.trialEndsAt) || now < toMillis(profile.subscriptionPaidUntil);
+};
+
 const requireFirebaseUser = async (req, res, next) => {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -556,9 +580,21 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
   try {
     const sessionId = await db.runTransaction(async (tx) => {
       const tableRef = db.doc(`restaurants/${restaurantId}/tables/${table}`);
-      const tableSnap = await tx.get(tableRef);
+      const profileRef = db.doc(`restaurants/${restaurantId}/profile/info`);
+      const [tableSnap, profileSnap] = await Promise.all([
+        tx.get(tableRef),
+        tx.get(profileRef),
+      ]);
       if (!tableSnap.exists || tableSnap.data().token !== token) {
         throw Object.assign(new Error("Invalid table QR code."), { statusCode: 403 });
+      }
+
+      // Block ordering at suspended or lapsed-subscription venues.
+      if (!isVenueActive(profileSnap.data())) {
+        throw Object.assign(
+          new Error("This restaurant isn't accepting orders right now."),
+          { statusCode: 403 },
+        );
       }
 
       const currentSessionId = tableSnap.data().currentSessionId || null;
@@ -575,7 +611,6 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
         }
       }
 
-      const profileSnap = await tx.get(db.doc(`restaurants/${restaurantId}/profile/info`));
       const paymentMode = normalizePaymentMode(profileSnap.data()?.paymentMode);
 
       const newSessionRef = db
@@ -980,6 +1015,150 @@ app.delete("/delete-user", requireFirebaseUser, async (req, res) => {
   } catch (err) {
     console.error("Delete user error:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Staff management (management only) ───────────────────────────────────────────
+// Roles a manager/owner/admin may assign. Owner is singular (set at signup); superadmin
+// is platform-level — neither is assignable here.
+const ASSIGNABLE_STAFF_ROLES = ["manager", "admin", "cashier", "waiter", "kitchen", "bar"];
+
+const genTempPassword = () => {
+  const raw = crypto.randomBytes(9).toString("base64").replace(/[^a-zA-Z0-9]/g, "");
+  // Always satisfies Firebase's 6-char minimum and mixes letters + a digit.
+  return `Srv${raw.slice(0, 8)}7`;
+};
+
+// POST /create-staff — create a staff login with a temporary password (returned once).
+app.post(
+  "/create-staff",
+  rateLimit({ windowMs: 60_000, max: 20 }),
+  requireFirebaseUser,
+  async (req, res) => {
+    const { restaurantId, name, email, role } = req.body || {};
+    const cleanedRestaurantId = String(restaurantId || "").trim();
+    const cleanedEmail = String(email || "").trim().toLowerCase();
+    const cleanedName = String(name || "").trim();
+    if (!cleanedRestaurantId || !cleanedEmail || !ASSIGNABLE_STAFF_ROLES.includes(role)) {
+      return res
+        .status(400)
+        .json({ error: "restaurantId, email and a valid role are required." });
+    }
+    if (!(await userCanManage(req.firebaseUser.uid, cleanedRestaurantId))) {
+      return res.status(403).json({ error: "Not authorized for this restaurant" });
+    }
+    try {
+      const tempPassword = genTempPassword();
+      const userRecord = await admin.auth().createUser({
+        email: cleanedEmail,
+        password: tempPassword,
+        displayName: cleanedName || undefined,
+        emailVerified: true, // vouched for by management — no separate verification step
+      });
+      await db.doc(`users/${userRecord.uid}`).set({
+        restaurantId: cleanedRestaurantId,
+        email: cleanedEmail,
+        name: cleanedName,
+        role,
+        createdAt: FieldValue.serverTimestamp(),
+        createdBy: req.firebaseUser.uid,
+      });
+      return res.json({
+        success: true,
+        uid: userRecord.uid,
+        email: cleanedEmail,
+        tempPassword,
+      });
+    } catch (err) {
+      if (err.code === "auth/email-already-exists") {
+        return res.status(409).json({ error: "That email already has an account." });
+      }
+      if (err.code === "auth/invalid-email") {
+        return res.status(400).json({ error: "That email address is invalid." });
+      }
+      console.error("Create staff error:", err);
+      return res.status(500).json({ error: "Could not create staff member." });
+    }
+  },
+);
+
+// GET /staff?restaurantId= — list a restaurant's staff accounts.
+app.get("/staff", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.query.restaurantId || "").trim();
+  if (!restaurantId) return res.status(400).json({ error: "restaurantId is required" });
+  if (!(await userCanManage(req.firebaseUser.uid, restaurantId))) {
+    return res.status(403).json({ error: "Not authorized for this restaurant" });
+  }
+  try {
+    const snap = await db.collection("users").where("restaurantId", "==", restaurantId).get();
+    const staff = snap.docs.map((d) => ({
+      uid: d.id,
+      email: d.data().email || "",
+      name: d.data().name || "",
+      role: d.data().role || "owner",
+    }));
+    return res.json({ staff });
+  } catch (err) {
+    console.error("List staff error:", err);
+    return res.status(500).json({ error: "Could not load staff." });
+  }
+});
+
+// POST /update-staff-role — change a staff member's role.
+app.post("/update-staff-role", requireFirebaseUser, async (req, res) => {
+  const { restaurantId, uid, role } = req.body || {};
+  const cleanedRestaurantId = String(restaurantId || "").trim();
+  const cleanedUid = String(uid || "").trim();
+  if (!cleanedRestaurantId || !cleanedUid || !ASSIGNABLE_STAFF_ROLES.includes(role)) {
+    return res
+      .status(400)
+      .json({ error: "restaurantId, uid and a valid role are required." });
+  }
+  if (!(await userCanManage(req.firebaseUser.uid, cleanedRestaurantId))) {
+    return res.status(403).json({ error: "Not authorized for this restaurant" });
+  }
+  try {
+    const userRef = db.doc(`users/${cleanedUid}`);
+    const snap = await userRef.get();
+    if (!snap.exists || snap.data().restaurantId !== cleanedRestaurantId) {
+      return res.status(404).json({ error: "Staff member not found." });
+    }
+    if (snap.data().role === "owner") {
+      return res.status(400).json({ error: "The owner's role cannot be changed." });
+    }
+    await userRef.update({ role });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Update staff role error:", err);
+    return res.status(500).json({ error: "Could not update role." });
+  }
+});
+
+// DELETE /delete-staff — remove a staff login (auth account + user doc).
+app.delete("/delete-staff", requireFirebaseUser, async (req, res) => {
+  const { restaurantId, uid } = req.body || {};
+  const cleanedRestaurantId = String(restaurantId || "").trim();
+  const cleanedUid = String(uid || "").trim();
+  if (!cleanedRestaurantId || !cleanedUid) {
+    return res.status(400).json({ error: "restaurantId and uid are required." });
+  }
+  if (!(await userCanManage(req.firebaseUser.uid, cleanedRestaurantId))) {
+    return res.status(403).json({ error: "Not authorized for this restaurant" });
+  }
+  try {
+    const snap = await db.doc(`users/${cleanedUid}`).get();
+    if (!snap.exists || snap.data().restaurantId !== cleanedRestaurantId) {
+      return res.status(404).json({ error: "Staff member not found." });
+    }
+    if (snap.data().role === "owner") {
+      return res.status(400).json({ error: "The owner account cannot be removed here." });
+    }
+    await db.doc(`users/${cleanedUid}`).delete();
+    await admin.auth().deleteUser(cleanedUid).catch(() => {});
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Delete staff error:", err);
+    return res.status(500).json({ error: "Could not remove staff member." });
   }
 });
 
