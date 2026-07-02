@@ -25,6 +25,10 @@ admin.initializeApp({
 const app = express();
 const port = 4000;
 const resend = new Resend(process.env.RESEND_API_KEY);
+// Sender for all transactional email. Set MAIL_FROM to your verified Resend domain,
+// e.g. "Servrr <welcome@servrr.ng>". Falls back to the sandbox if unset (goes to spam).
+const MAIL_FROM = process.env.MAIL_FROM || "Servrr <onboarding@resend.dev>";
+const APP_URL = process.env.APP_URL || "https://servrr.ng";
 const db = admin.firestore();
 const { FieldValue } = admin.firestore;
 
@@ -225,6 +229,56 @@ const verifyPaystackReference = async (reference) => {
   return data.data;
 };
 
+// Generate a Firebase email-verification link. Tries to send the user back to the
+// app's /login afterwards; falls back to the default handler if that domain isn't
+// in Firebase's authorized domains yet.
+const genVerifyLink = async (email) => {
+  try {
+    return await admin.auth().generateEmailVerificationLink(email, {
+      url: `${APP_URL}/login`,
+      handleCodeInApp: false,
+    });
+  } catch (_) {
+    return admin.auth().generateEmailVerificationLink(email);
+  }
+};
+
+// Branded welcome + email-verification message, sent via Resend from the verified domain.
+const sendWelcomeEmail = async (email, name, verifyLink) => {
+  const safeName = escapeHtml(name || "there");
+  const html = `
+    <div style="background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:480px;margin:0 auto;padding:40px 28px;">
+      <p style="color:#fa5631;font-size:22px;font-weight:900;letter-spacing:-0.5px;margin:0 0 28px 0;">SERVRR</p>
+      <h1 style="color:#fff;font-size:24px;font-weight:800;margin:0 0 12px 0;">Welcome, ${safeName} 👋</h1>
+      <p style="color:#aaa;font-size:14px;line-height:1.6;margin:0 0 24px 0;">
+        Your restaurant workspace is ready. One quick step to activate it — confirm your email address:
+      </p>
+      <a href="${verifyLink}" style="display:inline-block;background:#fa5631;color:#0a0a0a;font-size:14px;font-weight:800;text-decoration:none;padding:14px 32px;border-radius:10px;margin-bottom:28px;">
+        Verify my email
+      </a>
+      <div style="background:#111;border:1px solid #222;border-radius:14px;padding:20px;margin:8px 0 24px 0;">
+        <p style="color:#666;font-size:11px;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin:0 0 12px 0;">What's next</p>
+        <p style="color:#ccc;font-size:13px;line-height:1.7;margin:0;">
+          1. Verify your email (button above)<br/>
+          2. Log in to your dashboard<br/>
+          3. Add your menu &amp; generate table QR codes<br/>
+          4. Start taking orders
+        </p>
+      </div>
+      <p style="color:#555;font-size:11px;line-height:1.5;margin:0;word-break:break-all;">
+        If the button doesn't work, paste this link into your browser:<br/>${verifyLink}
+      </p>
+      <p style="color:#333;font-size:11px;text-align:center;margin-top:32px;">© ${new Date().getFullYear()} SERVRR</p>
+    </div>`;
+
+  await resend.emails.send({
+    from: MAIL_FROM,
+    to: [email],
+    subject: "Welcome to Servrr — verify your email",
+    html,
+  });
+};
+
 app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requireFirebaseUser, async (req, res) => {
   const {
     inviteCode,
@@ -349,7 +403,15 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
       return { restaurantId };
     });
 
-    // Fire welcome email — non-blocking
+    // Send the branded welcome + verification email — non-blocking (don't fail
+    // signup if email delivery has a hiccup; the login page can resend).
+    try {
+      const verifyLink = await genVerifyLink(email);
+      await sendWelcomeEmail(email, name, verifyLink);
+    } catch (mailErr) {
+      console.error("Welcome email failed:", mailErr);
+    }
+
     return res.json({ success: true, ...result });
   } catch (err) {
     console.error("Complete signup error:", err);
@@ -358,6 +420,25 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
     });
   }
 });
+
+// POST /resend-verification — re-send the branded verification email to the signed-in user.
+app.post(
+  "/resend-verification",
+  rateLimit({ windowMs: 60_000, max: 5 }),
+  requireFirebaseUser,
+  async (req, res) => {
+    const email = req.firebaseUser.email;
+    if (!email) return res.status(400).json({ error: "No email on this account." });
+    try {
+      const verifyLink = await genVerifyLink(email);
+      await sendWelcomeEmail(email, req.firebaseUser.name, verifyLink);
+      return res.json({ success: true });
+    } catch (err) {
+      console.error("Resend verification failed:", err);
+      return res.status(500).json({ error: "Could not resend verification email." });
+    }
+  },
+);
 
 // GET /banks — fetch supported Nigerian banks from Paystack (always up-to-date codes)
 app.get("/banks", async (req, res) => {
@@ -1199,7 +1280,7 @@ app.post("/send-receipt", rateLimit({ windowMs: 60_000, max: 20 }), requireFireb
 
   try {
     await resend.emails.send({
-      from: "SERVRR <onboarding@resend.dev>",
+      from: MAIL_FROM,
       to: emails,
       subject: `Your receipt from ${restaurantName} — Table ${table}`,
       html,
