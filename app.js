@@ -131,6 +131,10 @@ const toMillis = (ts) => {
   return Number.isFinite(d) ? d : 0;
 };
 
+// 3-day grace period after a trial/subscription lapses — venue keeps working while
+// the owner is nudged to pay; the daily sweep suspends only after grace runs out.
+const GRACE_MS = 3 * 24 * 60 * 60 * 1000;
+
 // Whether a venue may currently take orders — mirrors the client gating in
 // RestaurantContext so a lapsed/suspended venue can't be ordered from via the API.
 const isVenueActive = (profile) => {
@@ -144,7 +148,8 @@ const isVenueActive = (profile) => {
     profile.businessType;
   if (!hasSubFields) return true;
   const now = Date.now();
-  return now < toMillis(profile.trialEndsAt) || now < toMillis(profile.subscriptionPaidUntil);
+  const lapseAt = Math.max(toMillis(profile.trialEndsAt), toMillis(profile.subscriptionPaidUntil));
+  return now < lapseAt + GRACE_MS;
 };
 
 const requireFirebaseUser = async (req, res, next) => {
@@ -293,6 +298,131 @@ const sendWelcomeEmail = async (email, name, verifyLink) => {
   });
 };
 
+// Small branded template for billing lifecycle emails (trial ending, payment due).
+const sendBillingEmail = async ({ to, subject, heading, message, restaurantId }) => {
+  const html = `
+    <div style="background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:480px;margin:0 auto;padding:40px 28px;">
+      <p style="color:#fa5631;font-size:22px;font-weight:900;letter-spacing:-0.5px;margin:0 0 28px 0;">SERVRR</p>
+      <h1 style="color:#fff;font-size:22px;font-weight:800;margin:0 0 12px 0;">${escapeHtml(heading)}</h1>
+      <p style="color:#aaa;font-size:14px;line-height:1.7;margin:0 0 24px 0;">${message}</p>
+      <a href="${APP_URL}/${encodeURIComponent(restaurantId)}/admin" style="display:inline-block;background:#fa5631;color:#0a0a0a;font-size:14px;font-weight:800;text-decoration:none;padding:14px 32px;border-radius:10px;margin-bottom:24px;">
+        Open my dashboard
+      </a>
+      <p style="color:#555;font-size:12px;line-height:1.6;margin:0;">
+        To pay: reply to this email or message us on WhatsApp — payment is confirmed within 2 hours.
+      </p>
+      <p style="color:#333;font-size:11px;text-align:center;margin-top:32px;">© ${new Date().getFullYear()} SERVRR</p>
+    </div>`;
+  await resend.emails.send({ from: MAIL_FROM, to: [to], subject, html });
+};
+
+// ── Subscription sweep ───────────────────────────────────────────────────────────
+// Runs in-process (Cloud Functions need the Blaze plan): reminds owners 2 days before
+// trial ends, notifies on lapse (grace starts), suspends after grace, and reactivates
+// renewed venues. Idempotent via marker fields on the profile; safe to run repeatedly.
+const TRIAL_REMINDER_MS = 2 * 24 * 60 * 60 * 1000;
+let sweepRunning = false;
+
+const runSubscriptionSweep = async () => {
+  if (sweepRunning) return;
+  sweepRunning = true;
+  try {
+    const usersSnap = await db.collection("users").where("role", "==", "owner").get();
+    const seen = new Set();
+    const now = Date.now();
+
+    for (const userDoc of usersSnap.docs) {
+      const { restaurantId } = userDoc.data();
+      if (!restaurantId || seen.has(restaurantId)) continue;
+      seen.add(restaurantId);
+
+      const profileRef = db.doc(`restaurants/${restaurantId}/profile/info`);
+      const snap = await profileRef.get();
+      if (!snap.exists) continue;
+      const p = snap.data();
+
+      // Legacy venues and manual suspensions are left alone.
+      const hasSubFields = p.trialEndsAt || p.subscriptionPaidUntil || p.plan || p.businessType;
+      if (!hasSubFields) continue;
+      if (p.suspended === true && p.suspendedReason === "manual") continue;
+
+      const ownerEmail = p.email || userDoc.data().email;
+      const trialEnd = toMillis(p.trialEndsAt);
+      const paidUntil = toMillis(p.subscriptionPaidUntil);
+      const lapseAt = Math.max(trialEnd, paidUntil);
+      const inTrial = now < trialEnd;
+      const isPaid = now < paidUntil;
+
+      try {
+        // 1. Trial ending in <= 2 days → one reminder, ever.
+        if (
+          inTrial &&
+          !isPaid &&
+          trialEnd - now <= TRIAL_REMINDER_MS &&
+          !p.trialReminderSentAt &&
+          ownerEmail
+        ) {
+          const daysLeft = Math.max(1, Math.ceil((trialEnd - now) / 86400000));
+          await sendBillingEmail({
+            to: ownerEmail,
+            subject: `Your Servrr trial ends in ${daysLeft} day${daysLeft > 1 ? "s" : ""}`,
+            heading: "Your free trial is almost up",
+            message: `Your trial for <strong style="color:#fff">${escapeHtml(p.name || restaurantId)}</strong> ends in ${daysLeft} day${daysLeft > 1 ? "s" : ""}. Activate your subscription now so your QR ordering keeps running without interruption.`,
+            restaurantId,
+          });
+          await profileRef.update({ trialReminderSentAt: FieldValue.serverTimestamp() });
+        }
+
+        // 2. Just lapsed (grace window) → one notice per lapse (re-arms after each renewal).
+        if (!inTrial && !isPaid && now < lapseAt + GRACE_MS) {
+          if (p.expiryNoticeForLapse !== lapseAt && ownerEmail) {
+            await sendBillingEmail({
+              to: ownerEmail,
+              subject: "Action needed — your Servrr subscription has expired",
+              heading: "Payment due",
+              message: `The subscription for <strong style="color:#fff">${escapeHtml(p.name || restaurantId)}</strong> has expired. Your restaurant keeps working for a 3-day grace period — after that, ordering pauses until payment is confirmed.`,
+              restaurantId,
+            });
+            await profileRef.update({ expiryNoticeForLapse: lapseAt });
+          }
+        }
+
+        // 3. Past grace → suspend.
+        if (!inTrial && !isPaid && now >= lapseAt + GRACE_MS && p.suspended !== true) {
+          await profileRef.update({
+            suspended: true,
+            suspendedReason: "subscription_expired",
+            suspendedAt: FieldValue.serverTimestamp(),
+            subscriptionStatus: "expired",
+          });
+          console.log(`[sweep] suspended ${restaurantId} (lapsed ${new Date(lapseAt).toISOString()})`);
+        }
+
+        // 4. Renewed while auto-suspended → reactivate.
+        if ((inTrial || isPaid) && p.suspended === true && p.suspendedReason === "subscription_expired") {
+          await profileRef.update({
+            suspended: false,
+            suspendedReason: null,
+            subscriptionStatus: isPaid ? "active" : "trial",
+          });
+          console.log(`[sweep] reactivated ${restaurantId}`);
+        }
+      } catch (err) {
+        console.error(`[sweep] error for ${restaurantId}:`, err);
+      }
+    }
+  } catch (err) {
+    console.error("[sweep] failed:", err);
+  } finally {
+    sweepRunning = false;
+  }
+};
+
+// Kick off shortly after boot (Render restarts often, so boot-time runs keep it fresh),
+// then every 6 hours while the instance is awake.
+setTimeout(runSubscriptionSweep, 30_000).unref?.();
+setInterval(runSubscriptionSweep, 6 * 60 * 60 * 1000).unref?.();
+
 app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requireFirebaseUser, async (req, res) => {
   const {
     inviteCode,
@@ -404,6 +534,7 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
         subscriptionStatus: "trial",
         trialEndsAt,
         subscriptionPaidUntil: null,
+        suspended: false,
         createdAt: FieldValue.serverTimestamp(),
       });
 
@@ -825,6 +956,37 @@ app.post("/request-bill", async (req, res) => {
     console.error("Request bill error:", err);
     return res.status(err.statusCode || 500).json({
       error: err.message || "Could not request bill.",
+    });
+  }
+});
+
+// POST /call-waiter — diner-triggered, flags the session so staff get an alert (public)
+app.post("/call-waiter", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const sessionId = String(req.body?.sessionId || "").trim();
+  if (!restaurantId || !sessionId) {
+    return res.status(400).json({ error: "restaurantId and sessionId are required" });
+  }
+
+  try {
+    await db.runTransaction(async (tx) => {
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
+      const sessionSnap = await tx.get(sessionRef);
+      if (!sessionSnap.exists) {
+        throw Object.assign(new Error("Table session not found."), { statusCode: 404 });
+      }
+      const session = sessionSnap.data();
+      if (!["open", "awaiting_payment"].includes(session.status)) {
+        throw Object.assign(new Error("This table's session is closed."), { statusCode: 409 });
+      }
+      tx.update(sessionRef, { waiterCalledAt: FieldValue.serverTimestamp() });
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Call waiter error:", err);
+    return res.status(err.statusCode || 500).json({
+      error: err.message || "Could not call the waiter.",
     });
   }
 });
