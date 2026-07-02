@@ -1041,6 +1041,8 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
         paidVia,
         closedByUid: req.firebaseUser.uid,
         totalBill: total,
+        // Bill settled — any outstanding "call waiter" is answered by definition.
+        waiterCalledAt: null,
       });
 
       orderSnaps.forEach((snap) => {
@@ -1053,16 +1055,32 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
         { merge: true },
       );
 
+      // Receipt bills are grouped per guest: same email = one bill, different
+      // guests (email, else name) stay separate.
+      const groups = new Map();
+      orderSnaps
+        .filter((snap) => snap.exists)
+        .forEach((snap) => {
+          const o = snap.data();
+          const email = String(o.email || "").trim().toLowerCase();
+          const name = String(o.customerName || "").trim().toLowerCase();
+          const key = email ? `e:${email}` : name ? `n:${name}` : `o:${snap.id}`;
+          if (!groups.has(key)) {
+            groups.set(key, {
+              customerName: o.customerName || "Guest",
+              items: [],
+              total: 0,
+            });
+          }
+          const g = groups.get(key);
+          g.items.push(...(o.items || []));
+          g.total += Number(o.total || 0);
+        });
+
       return {
         restaurantName: profileSnap.data()?.name || restaurantId,
         table: session.table,
-        orders: orderSnaps
-          .filter((snap) => snap.exists)
-          .map((snap) => ({
-            customerName: snap.data().customerName || "Guest",
-            items: snap.data().items || [],
-            total: snap.data().total || 0,
-          })),
+        orders: [...groups.values()],
         totalBill: total,
         paidVia,
         closedAt: new Date().toISOString(),
@@ -1276,6 +1294,7 @@ app.post("/finalize-online-payment", rateLimit({ windowMs: 60_000, max: 30 }), a
           paymentMode: "pay_online",
           paymentStatus: "paid",
           paymentRef: cleanedReference,
+          waiterCalledAt: null,
         },
         { merge: true },
       );
@@ -1422,6 +1441,8 @@ app.post("/reset-staff-password", requireFirebaseUser, async (req, res) => {
     if (!staff) return res.status(404).json({ error: "No staff login to reset." });
     const tempPassword = genTempPassword();
     await admin.auth().updateUser(staff.uid, { password: tempPassword });
+    // Kill any live sessions too (e.g. a stolen tablet) — not just future logins.
+    await admin.auth().revokeRefreshTokens(staff.uid).catch(() => {});
     return res.json({ success: true, email: staff.email || "", tempPassword });
   } catch (err) {
     console.error("Reset staff password error:", err);
@@ -1447,6 +1468,90 @@ app.delete("/delete-staff", requireFirebaseUser, async (req, res) => {
     return res.status(500).json({ error: "Could not remove staff login." });
   }
 });
+
+// POST /notify-login — new-device login alerts. Each browser sends a stable device ID
+// after sign-in; the first-ever device registers silently, any later unknown device is
+// registered AND triggers an alert email. Staff-login alerts go to the venue owner.
+app.post(
+  "/notify-login",
+  rateLimit({ windowMs: 60_000, max: 10 }),
+  requireFirebaseUser,
+  async (req, res) => {
+    const deviceId = String(req.body?.deviceId || "").trim().slice(0, 100);
+    if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+
+    try {
+      const userRef = db.doc(`users/${req.firebaseUser.uid}`);
+      const snap = await userRef.get();
+      if (!snap.exists) return res.json({ known: true }); // super admin — no user doc
+
+      const userData = snap.data();
+      const known = Array.isArray(userData.knownDevices) ? userData.knownDevices : [];
+      if (known.includes(deviceId)) return res.json({ known: true });
+
+      await userRef.update({ knownDevices: FieldValue.arrayUnion(deviceId) });
+
+      // First device ever (incl. everyone's next login after this feature ships):
+      // register quietly so we don't blast alerts for normal use.
+      if (known.length === 0) return res.json({ known: false, first: true });
+
+      // Staff logins alert the owner (they own the credential); others alert themselves.
+      let to = req.firebaseUser.email || userData.email || "";
+      const isStaff = userData.role === "staff";
+      if (isStaff && userData.restaurantId) {
+        const profSnap = await db
+          .doc(`restaurants/${userData.restaurantId}/profile/info`)
+          .get();
+        to = profSnap.data()?.email || to;
+      }
+
+      if (to) {
+        const ua = String(req.headers["user-agent"] || "Unknown device").slice(0, 180);
+        const when = new Date().toLocaleString("en-NG", {
+          timeZone: "Africa/Lagos",
+          dateStyle: "medium",
+          timeStyle: "short",
+        });
+        const acct = isStaff
+          ? `the STAFF login (${escapeHtml(userData.email || "")})`
+          : "your Servrr account";
+        const advice = isStaff
+          ? "reset the staff password from your dashboard's Staff tab"
+          : 'use "Forgot password" on the login page to reset it';
+        await resend.emails.send({
+          from: MAIL_FROM,
+          to: [to],
+          subject: "New sign-in to your Servrr account",
+          html: `
+            <div style="background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:480px;margin:0 auto;padding:40px 28px;">
+              <p style="color:#fa5631;font-size:22px;font-weight:900;letter-spacing:-0.5px;margin:0 0 28px 0;">SERVRR</p>
+              <h1 style="color:#fff;font-size:22px;font-weight:800;margin:0 0 12px 0;">New sign-in detected</h1>
+              <p style="color:#aaa;font-size:14px;line-height:1.7;margin:0 0 20px 0;">
+                A device that hasn't been used before just signed in to ${acct}.
+              </p>
+              <div style="background:#111;border:1px solid #222;border-radius:14px;padding:18px;margin-bottom:24px;">
+                <p style="color:#ccc;font-size:13px;line-height:1.8;margin:0;">
+                  <strong style="color:#fff">When:</strong> ${escapeHtml(when)} (Lagos)<br/>
+                  <strong style="color:#fff">Device:</strong> ${escapeHtml(ua)}<br/>
+                  <strong style="color:#fff">IP:</strong> ${escapeHtml(String(req.ip || "unknown"))}
+                </p>
+              </div>
+              <p style="color:#aaa;font-size:13px;line-height:1.7;margin:0;">
+                If this was you or your team, no action is needed. If not, ${advice} immediately —
+                that signs the device out.
+              </p>
+              <p style="color:#333;font-size:11px;text-align:center;margin-top:32px;">© ${new Date().getFullYear()} SERVRR</p>
+            </div>`,
+        });
+      }
+
+      return res.json({ known: false });
+    } catch (err) {
+      console.error("notify-login error:", err);
+      return res.status(500).json({ error: "Could not record login." });
+    }
+  },
+);
 
 // POST /send-receipt — email the full bill to the customer(s) when the table is closed (staff only)
 app.post("/send-receipt", rateLimit({ windowMs: 60_000, max: 20 }), requireFirebaseUser, async (req, res) => {
