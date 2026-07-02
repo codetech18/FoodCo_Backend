@@ -38,15 +38,25 @@ app.set("trust proxy", 1);
 // ── CORS ───────────────────────────────────────────────────────────────────────
 // Set ALLOWED_ORIGINS (comma-separated) in the environment to lock the API to your
 // real frontend origins. If unset, falls back to permissive (logged) so nothing breaks.
+// Origins are normalized (trailing slashes, stray quotes, case) so near-miss values still match.
+const normalizeOrigin = (o) =>
+  String(o || "")
+    .trim()
+    .replace(/^['"]|['"]$/g, "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
-  .map((s) => s.trim())
+  .map(normalizeOrigin)
   .filter(Boolean);
 
 if (ALLOWED_ORIGINS.length === 0) {
   console.warn(
     "[cors] ALLOWED_ORIGINS not set — allowing all origins. Set it to lock down CORS in production.",
   );
+} else {
+  console.log(`[cors] allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
 }
 
 app.use(
@@ -55,8 +65,12 @@ app.use(
       // Non-browser / same-origin requests (no Origin header) are always allowed.
       if (!origin) return cb(null, true);
       if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS"));
+      if (ALLOWED_ORIGINS.includes(normalizeOrigin(origin))) return cb(null, true);
+      console.warn(
+        `[cors] rejected origin "${origin}" — allowed: ${ALLOWED_ORIGINS.join(", ")}`,
+      );
+      // Deny by omitting CORS headers (browser blocks) rather than erroring with a 500.
+      return cb(null, false);
     },
   }),
 );
@@ -646,6 +660,58 @@ app.get("/table-token", requireFirebaseUser, async (req, res) => {
   } catch (err) {
     console.error("Table token error:", err);
     return res.status(500).json({ error: "Could not fetch table token." });
+  }
+});
+
+// GET /table-tokens?restaurantId=&count= — mint/fetch tokens for tables 1..count in ONE
+// request (the per-table route above does a round trip per table, which is painfully slow
+// from high-latency connections). Staff only.
+app.get("/table-tokens", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.query.restaurantId || "").trim();
+  const count = Math.min(100, Math.max(1, Number(req.query.count) || 0));
+  if (!restaurantId || !count) {
+    return res.status(400).json({ error: "restaurantId and count are required" });
+  }
+
+  try {
+    if (!(await userCanOperate(req.firebaseUser.uid, restaurantId))) {
+      return res.status(403).json({ error: "Not authorized for this restaurant" });
+    }
+
+    const refs = Array.from({ length: count }, (_, i) =>
+      db.doc(`restaurants/${restaurantId}/tables/${i + 1}`),
+    );
+    const snaps = await db.getAll(...refs);
+
+    const tokens = {};
+    const batch = db.batch();
+    let mintedAny = false;
+    snaps.forEach((snap, i) => {
+      const table = i + 1;
+      if (snap.exists && snap.data().token) {
+        tokens[table] = snap.data().token;
+        return;
+      }
+      const newToken = crypto.randomBytes(16).toString("hex");
+      tokens[table] = newToken;
+      mintedAny = true;
+      batch.set(
+        snap.ref,
+        {
+          token: newToken,
+          currentSessionId: snap.exists ? snap.data().currentSessionId ?? null : null,
+          createdAt: snap.exists ? snap.data().createdAt : FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+    });
+    if (mintedAny) await batch.commit();
+
+    return res.json({ tokens });
+  } catch (err) {
+    console.error("Table tokens error:", err);
+    return res.status(500).json({ error: "Could not fetch table tokens." });
   }
 });
 
