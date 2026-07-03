@@ -78,6 +78,14 @@ app.use(
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ limit: "25mb" }));
 
+// Baseline security headers for API responses (the frontend's headers live in vercel.json).
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  next();
+});
+
 // ── Rate limiting ──────────────────────────────────────────────────────────────
 // Lightweight in-memory fixed-window limiter (sufficient for a single instance;
 // use a shared store like Redis if the backend is ever horizontally scaled).
@@ -1001,8 +1009,10 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
   if (!restaurantId || !sessionId) {
     return res.status(400).json({ error: "restaurantId and sessionId are required" });
   }
-  if (!["cash", "pos"].includes(paidVia)) {
-    return res.status(400).json({ error: "paidVia must be 'cash' or 'pos'" });
+  if (!["cash", "pos", "online"].includes(paidVia)) {
+    return res
+      .status(400)
+      .json({ error: "paidVia must be 'cash', 'pos' or 'online'" });
   }
   if (!Number.isFinite(total) || total < 0) {
     return res.status(400).json({ error: "Invalid confirmed total." });
@@ -1237,6 +1247,7 @@ app.post("/finalize-online-payment", rateLimit({ windowMs: 60_000, max: 30 }), a
         .collection(`restaurants/${cleanedRestaurantId}/orders`)
         .doc();
       let sessionRef;
+      let isNewSession = false;
       let existingOrderIds = [];
       let nextTotalBill = numericTotal;
 
@@ -1264,6 +1275,7 @@ app.post("/finalize-online-payment", rateLimit({ windowMs: 60_000, max: 30 }), a
         sessionRef = db
           .collection(`restaurants/${cleanedRestaurantId}/tableSessions`)
           .doc();
+        isNewSession = true;
       }
 
       tx.set(orderRef, {
@@ -1280,24 +1292,43 @@ app.post("/finalize-online-payment", rateLimit({ windowMs: 60_000, max: 30 }), a
         createdAt: FieldValue.serverTimestamp(),
       });
 
+      // Paying online settles the ORDER, not the table: the session stays open
+      // so the same party can keep ordering (each order prepaid) until staff
+      // close the table. Closing terminally here broke follow-up orders.
       tx.set(
         sessionRef,
         {
           table: cleanedTable,
-          status: "paid",
-          openedAt: FieldValue.serverTimestamp(),
+          ...(isNewSession
+            ? {
+                status: "open",
+                openedAt: FieldValue.serverTimestamp(),
+                billRequestedAt: null,
+                closedAt: null,
+                paidVia: null,
+                closedByUid: null,
+              }
+            : {}),
           updatedAt: FieldValue.serverTimestamp(),
-          paidAt: FieldValue.serverTimestamp(),
-          closedAt: FieldValue.serverTimestamp(),
           totalBill: nextTotalBill,
           orderIds: [...existingOrderIds, orderRef.id],
           paymentMode: "pay_online",
-          paymentStatus: "paid",
-          paymentRef: cleanedReference,
-          waiterCalledAt: null,
+          lastPaymentRef: cleanedReference,
         },
         { merge: true },
       );
+
+      // Register a freshly-created session on the table so rescans rejoin it.
+      if (isNewSession) {
+        tx.set(
+          db.doc(`restaurants/${cleanedRestaurantId}/tables/${cleanedTable}`),
+          {
+            currentSessionId: sessionRef.id,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      }
 
       tx.set(
         paymentRef,
