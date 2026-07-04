@@ -908,8 +908,11 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
                   tx.get(db.doc(`restaurants/${restaurantId}/orders/${id}`)),
                 ),
               );
+              // Cancelled orders are settled by definition — they never block recycling.
               const allServed = orderSnaps.every(
-                (s) => s.exists && s.data().status === "completed",
+                (s) =>
+                  s.exists &&
+                  ["completed", "cancelled"].includes(s.data().status),
               );
               if (allServed) {
                 recycleSessionRef = sessionRef; // close below, then create anew
@@ -1094,7 +1097,10 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
       });
 
       orderSnaps.forEach((snap) => {
-        if (snap.exists) tx.update(snap.ref, { paymentStatus: "paid" });
+        // Cancelled orders were never paid for — leave them out of the settlement.
+        if (snap.exists && snap.data().status !== "cancelled") {
+          tx.update(snap.ref, { paymentStatus: "paid" });
+        }
       });
 
       tx.set(
@@ -1107,7 +1113,7 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
       // guests (email, else name) stay separate.
       const groups = new Map();
       orderSnaps
-        .filter((snap) => snap.exists)
+        .filter((snap) => snap.exists && snap.data().status !== "cancelled")
         .forEach((snap) => {
           const o = snap.data();
           const email = String(o.email || "").trim().toLowerCase();
