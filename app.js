@@ -884,6 +884,7 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
       }
 
       const currentSessionId = tableSnap.data().currentSessionId || null;
+      let recycleSessionRef = null;
       if (currentSessionId) {
         const sessionRef = db.doc(
           `restaurants/${restaurantId}/tableSessions/${currentSessionId}`,
@@ -893,8 +894,45 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
           sessionSnap.exists &&
           ["open", "awaiting_payment"].includes(sessionSnap.data().status)
         ) {
-          return currentSessionId;
+          const session = sessionSnap.data();
+
+          // Prepaid (pay-online) sessions have no staff-forced closing moment.
+          // If every order on the session has been served, the party is done —
+          // recycle: archive the old session and start fresh for the new scan.
+          // Otherwise the next party would inherit a stranger's session.
+          if (normalizePaymentMode(session.paymentMode) === "pay_online") {
+            const ids = Array.isArray(session.orderIds) ? session.orderIds : [];
+            if (ids.length > 0) {
+              const orderSnaps = await Promise.all(
+                ids.map((id) =>
+                  tx.get(db.doc(`restaurants/${restaurantId}/orders/${id}`)),
+                ),
+              );
+              const allServed = orderSnaps.every(
+                (s) => s.exists && s.data().status === "completed",
+              );
+              if (allServed) {
+                recycleSessionRef = sessionRef; // close below, then create anew
+              } else {
+                return currentSessionId; // party still eating — rejoin
+              }
+            } else {
+              return currentSessionId; // fresh prepaid session, nothing ordered yet
+            }
+          } else {
+            return currentSessionId; // pay-at-table: staff closing is the boundary
+          }
         }
+      }
+
+      if (recycleSessionRef) {
+        tx.update(recycleSessionRef, {
+          status: "paid",
+          paidVia: "online",
+          closedAt: FieldValue.serverTimestamp(),
+          closedByUid: null,
+          waiterCalledAt: null,
+        });
       }
 
       const paymentMode = normalizePaymentMode(profileSnap.data()?.paymentMode);
