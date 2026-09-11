@@ -114,7 +114,9 @@ const rateLimit = ({ windowMs, max }) => (req, res, next) => {
 };
 
 const normalizePaymentMode = (mode) =>
-  mode === "pay_online" || mode === "online" ? "pay_online" : "at_table";
+  // Diner online payments are paused while SERVRR launches with cash, POS,
+  // and bank transfer settlement.
+  "at_table";
 
 const slugify = (name) =>
   String(name || "")
@@ -138,6 +140,11 @@ const toMillis = (ts) => {
   const d = new Date(ts).getTime();
   return Number.isFinite(d) ? d : 0;
 };
+
+const createSessionAccessToken = () => crypto.randomBytes(32).toString("hex");
+const hashSessionAccessToken = (token) =>
+  crypto.createHash("sha256").update(String(token || "")).digest("hex");
+const SESSION_IDLE_MS = 4 * 60 * 60 * 1000;
 
 // 3-day grace period after a trial/subscription lapses — venue keeps working while
 // the owner is nudged to pay; the daily sweep suspends only after grace runs out.
@@ -864,7 +871,10 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
   }
 
   try {
-    const sessionId = await db.runTransaction(async (tx) => {
+    const result = await db.runTransaction(async (tx) => {
+      const accessToken = createSessionAccessToken();
+      const accessTokenHash = hashSessionAccessToken(accessToken);
+      const accessTokenExpiresAt = Date.now() + 60 * 60 * 1000;
       const tableRef = db.doc(`restaurants/${restaurantId}/tables/${table}`);
       const profileRef = db.doc(`restaurants/${restaurantId}/profile/info`);
       const [tableSnap, profileSnap] = await Promise.all([
@@ -892,9 +902,24 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
         const sessionSnap = await tx.get(sessionRef);
         if (
           sessionSnap.exists &&
-          ["open", "awaiting_payment"].includes(sessionSnap.data().status)
+          ["open", "awaiting_payment", "transfer_reported"].includes(sessionSnap.data().status)
         ) {
           const session = sessionSnap.data();
+          const lastActivity = toMillis(session.updatedAt || session.openedAt);
+          if (lastActivity && Date.now() - lastActivity > SESSION_IDLE_MS) {
+            tx.update(sessionRef, {
+              status: "expired",
+              expiredAt: FieldValue.serverTimestamp(),
+              expiredReason: "idle",
+              waiterCalledAt: null,
+            });
+          } else {
+
+          const accessTokens = Array.isArray(session.accessTokens)
+            ? session.accessTokens.filter((entry) => Number(entry.expiresAt) > Date.now())
+            : [];
+          accessTokens.push({ hash: accessTokenHash, expiresAt: accessTokenExpiresAt });
+          tx.update(sessionRef, { accessTokens: accessTokens.slice(-20) });
 
           // Prepaid (pay-online) sessions have no staff-forced closing moment.
           // If every order on the session has been served, the party is done —
@@ -917,13 +942,14 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
               if (allServed) {
                 recycleSessionRef = sessionRef; // close below, then create anew
               } else {
-                return currentSessionId; // party still eating — rejoin
+                return { sessionId: currentSessionId, accessToken }; // party still eating — rejoin
               }
             } else {
-              return currentSessionId; // fresh prepaid session, nothing ordered yet
+              return { sessionId: currentSessionId, accessToken }; // fresh prepaid session, nothing ordered yet
             }
           } else {
-            return currentSessionId; // pay-at-table: staff closing is the boundary
+            return { sessionId: currentSessionId, accessToken }; // pay-at-table: staff closing is the boundary
+          }
           }
         }
       }
@@ -951,6 +977,7 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
         closedAt: null,
         totalBill: 0,
         orderIds: [],
+        accessTokens: [{ hash: accessTokenHash, expiresAt: accessTokenExpiresAt }],
         paymentMode,
         paidVia: null,
         closedByUid: null,
@@ -960,15 +987,189 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
         { currentSessionId: newSessionRef.id, updatedAt: FieldValue.serverTimestamp() },
         { merge: true },
       );
-      return newSessionRef.id;
+      return { sessionId: newSessionRef.id, accessToken };
     });
 
-    return res.json({ sessionId });
+    return res.json(result);
   } catch (err) {
     console.error("Open table session error:", err);
     return res.status(err.statusCode || 500).json({
       error: err.message || "Could not open table session.",
     });
+  }
+});
+
+// POST /place-order — server-authoritative pay-at-table order creation.
+// The client supplies the cart, but the server owns prices, totals, and the
+// atomic append to the table session.
+app.post("/place-order", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const sessionId = String(req.body?.sessionId || "").trim();
+  const accessToken = String(req.body?.accessToken || "").trim();
+  const customerName = String(req.body?.customerName || "").trim().slice(0, 120);
+  const email = String(req.body?.email || "").trim().slice(0, 160);
+  const table = String(req.body?.table || "").trim();
+  const allergies = String(req.body?.allergies || "").trim().slice(0, 500);
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+  if (!restaurantId || !sessionId || !accessToken || !customerName || !table) {
+    return res.status(400).json({ error: "A valid table session, name, and table are required." });
+  }
+  if (!validateOrderItems(items)) {
+    return res.status(400).json({ error: "Your order contains invalid items." });
+  }
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
+      const sessionSnap = await tx.get(sessionRef);
+      if (!sessionSnap.exists) {
+        throw Object.assign(new Error("Table session not found."), { statusCode: 404 });
+      }
+      const session = sessionSnap.data();
+      const tokenHash = hashSessionAccessToken(accessToken);
+      const tokenValid = Array.isArray(session.accessTokens) && session.accessTokens.some(
+        (entry) => entry.hash === tokenHash && Number(entry.expiresAt) > Date.now(),
+      );
+      if (!tokenValid || session.table !== table) {
+        throw Object.assign(new Error("Your table session has expired. Please scan the QR code again."), { statusCode: 403 });
+      }
+      if (session.status !== "open") {
+        throw Object.assign(new Error("This table is no longer accepting orders."), { statusCode: 409 });
+      }
+
+      const menuSnap = await tx.get(db.collection(`restaurants/${restaurantId}/menu`));
+      const menuByName = new Map(
+        menuSnap.docs.map((doc) => [String(doc.data().name || "").trim(), doc.data()]),
+      );
+      const verifiedItems = items.map((item) => {
+        const menuItem = menuByName.get(String(item.name || "").trim());
+        if (!menuItem || menuItem.available === false) {
+          throw Object.assign(new Error(`${item.name || "An item"} is no longer available.`), { statusCode: 409 });
+        }
+        const price = Number(menuItem.price);
+        if (!Number.isFinite(price)) {
+          throw Object.assign(new Error("A menu item has an invalid price."), { statusCode: 500 });
+        }
+        return { name: String(menuItem.name), price, qty: Number(item.qty) };
+      });
+      const total = calculateItemsTotal(verifiedItems);
+      const orderRef = db.collection(`restaurants/${restaurantId}/orders`).doc();
+      tx.set(orderRef, {
+        customerName,
+        email,
+        table,
+        allergies,
+        items: verifiedItems,
+        total,
+        status: "pending",
+        createdAt: FieldValue.serverTimestamp(),
+        sessionId,
+      });
+      tx.update(sessionRef, {
+        orderIds: FieldValue.arrayUnion(orderRef.id),
+        totalBill: FieldValue.increment(total),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return { orderId: orderRef.id };
+    });
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("Place order error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not place order." });
+  }
+});
+
+// POST /edit-order — recalculate a pending order and adjust the table atomically.
+app.post("/edit-order", rateLimit({ windowMs: 60_000, max: 20 }), async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const orderId = String(req.body?.orderId || "").trim();
+  const sessionId = String(req.body?.sessionId || "").trim();
+  const accessToken = String(req.body?.accessToken || "").trim();
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (!restaurantId || !orderId || !sessionId || !accessToken || !validateOrderItems(items)) {
+    return res.status(400).json({ error: "Invalid order update." });
+  }
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
+      const orderRef = db.doc(`restaurants/${restaurantId}/orders/${orderId}`);
+      const [sessionSnap, orderSnap, menuSnap] = await Promise.all([
+        tx.get(sessionRef),
+        tx.get(orderRef),
+        tx.get(db.collection(`restaurants/${restaurantId}/menu`)),
+      ]);
+      const session = sessionSnap.data();
+      const tokenHash = hashSessionAccessToken(accessToken);
+      const tokenValid = sessionSnap.exists && Array.isArray(session.accessTokens) && session.accessTokens.some(
+        (entry) => entry.hash === tokenHash && Number(entry.expiresAt) > Date.now(),
+      );
+      if (!tokenValid || session.status !== "open" || !orderSnap.exists) {
+        throw Object.assign(new Error("This order can no longer be edited."), { statusCode: 409 });
+      }
+      const order = orderSnap.data();
+      if (order.sessionId !== sessionId || order.status !== "pending" || order.paymentStatus === "paid") {
+        throw Object.assign(new Error("This order can no longer be edited."), { statusCode: 409 });
+      }
+      const menuByName = new Map(menuSnap.docs.map((doc) => [String(doc.data().name || "").trim(), doc.data()]));
+      const verifiedItems = items.map((item) => {
+        const menuItem = menuByName.get(String(item.name || "").trim());
+        if (!menuItem || menuItem.available === false) {
+          throw Object.assign(new Error(`${item.name || "An item"} is no longer available.`), { statusCode: 409 });
+        }
+        return { name: String(menuItem.name), price: Number(menuItem.price), qty: Number(item.qty) };
+      });
+      const nextTotal = calculateItemsTotal(verifiedItems);
+      tx.update(orderRef, { items: verifiedItems, total: nextTotal, updatedAt: FieldValue.serverTimestamp() });
+      tx.update(sessionRef, {
+        totalBill: FieldValue.increment(nextTotal - Number(order.total || 0)),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return { total: nextTotal };
+    });
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("Edit order error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not edit order." });
+  }
+});
+
+// POST /cancel-order — cancel a pending unpaid order and decrement the bill.
+app.post("/cancel-order", rateLimit({ windowMs: 60_000, max: 10 }), async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const orderId = String(req.body?.orderId || "").trim();
+  const sessionId = String(req.body?.sessionId || "").trim();
+  const accessToken = String(req.body?.accessToken || "").trim();
+  if (!restaurantId || !orderId || !sessionId || !accessToken) {
+    return res.status(400).json({ error: "Invalid cancellation request." });
+  }
+  try {
+    await db.runTransaction(async (tx) => {
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
+      const orderRef = db.doc(`restaurants/${restaurantId}/orders/${orderId}`);
+      const [sessionSnap, orderSnap] = await Promise.all([tx.get(sessionRef), tx.get(orderRef)]);
+      const session = sessionSnap.data();
+      const tokenHash = hashSessionAccessToken(accessToken);
+      const tokenValid = sessionSnap.exists && Array.isArray(session.accessTokens) && session.accessTokens.some(
+        (entry) => entry.hash === tokenHash && Number(entry.expiresAt) > Date.now(),
+      );
+      if (!tokenValid || session.status !== "open" || !orderSnap.exists) {
+        throw Object.assign(new Error("This order can no longer be cancelled."), { statusCode: 409 });
+      }
+      const order = orderSnap.data();
+      if (order.sessionId !== sessionId || order.status !== "pending" || order.paymentStatus === "paid") {
+        throw Object.assign(new Error("This order can no longer be cancelled."), { statusCode: 409 });
+      }
+      tx.update(orderRef, { status: "cancelled", updatedAt: FieldValue.serverTimestamp() });
+      tx.update(sessionRef, {
+        totalBill: FieldValue.increment(-Number(order.total || 0)),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Cancel order error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not cancel order." });
   }
 });
 
@@ -996,6 +1197,9 @@ app.post("/request-bill", async (req, res) => {
       tx.update(sessionRef, {
         status: "awaiting_payment",
         billRequestedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+        transferReportedAt: null,
+        transferReference: null,
       });
       return "awaiting_payment";
     });
@@ -1006,6 +1210,66 @@ app.post("/request-bill", async (req, res) => {
     return res.status(err.statusCode || 500).json({
       error: err.message || "Could not request bill.",
     });
+  }
+});
+
+// GET /transfer-details — return bank details only for an active bill session.
+// Full account numbers never live in the public restaurant profile.
+app.get("/transfer-details", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
+  const restaurantId = String(req.query.restaurantId || "").trim();
+  const sessionId = String(req.query.sessionId || "").trim();
+  if (!restaurantId || !sessionId) {
+    return res.status(400).json({ error: "restaurantId and sessionId are required" });
+  }
+
+  try {
+    const sessionSnap = await db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`).get();
+    if (!sessionSnap.exists || !["awaiting_payment", "transfer_reported"].includes(sessionSnap.data().status)) {
+      return res.status(409).json({ error: "Request the bill before viewing transfer details." });
+    }
+    const privateSnap = await db.doc(`restaurants/${restaurantId}/profile/private`).get();
+    const bank = privateSnap.exists ? privateSnap.data() : {};
+    if (!bank.bankName || !bank.accountName || !bank.accountNumber) {
+      return res.status(404).json({ error: "Bank transfer is not configured for this restaurant." });
+    }
+    return res.json({
+      bankName: String(bank.bankName),
+      accountName: String(bank.accountName),
+      accountNumber: String(bank.accountNumber),
+    });
+  } catch (err) {
+    console.error("Transfer details error:", err);
+    return res.status(500).json({ error: "Could not load transfer details." });
+  }
+});
+
+// POST /report-transfer — diner reports a transfer; staff still has to confirm it.
+app.post("/report-transfer", rateLimit({ windowMs: 60_000, max: 5 }), async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const sessionId = String(req.body?.sessionId || "").trim();
+  const reference = String(req.body?.reference || "").trim().slice(0, 80);
+  if (!restaurantId || !sessionId) {
+    return res.status(400).json({ error: "restaurantId and sessionId are required" });
+  }
+
+  try {
+    await db.runTransaction(async (tx) => {
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
+      const sessionSnap = await tx.get(sessionRef);
+      if (!sessionSnap.exists || sessionSnap.data().status !== "awaiting_payment") {
+        throw Object.assign(new Error("This table is not awaiting payment."), { statusCode: 409 });
+      }
+      tx.update(sessionRef, {
+        status: "transfer_reported",
+        transferReportedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+        transferReference: reference || null,
+      });
+    });
+    return res.json({ success: true, status: "transfer_reported" });
+  } catch (err) {
+    console.error("Report transfer error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not report transfer." });
   }
 });
 
@@ -1050,10 +1314,10 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
   if (!restaurantId || !sessionId) {
     return res.status(400).json({ error: "restaurantId and sessionId are required" });
   }
-  if (!["cash", "pos", "online"].includes(paidVia)) {
+  if (!["cash", "pos", "transfer", "online"].includes(paidVia)) {
     return res
       .status(400)
-      .json({ error: "paidVia must be 'cash', 'pos' or 'online'" });
+      .json({ error: "paidVia must be 'cash', 'pos' or 'transfer'" });
   }
   if (!Number.isFinite(total) || total < 0) {
     return res.status(400).json({ error: "Invalid confirmed total." });
@@ -1073,6 +1337,11 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
       const session = sessionSnap.data();
       if (session.status === "paid") {
         throw Object.assign(new Error("Table session is already closed."), {
+          statusCode: 409,
+        });
+      }
+      if (paidVia === "transfer" && session.status !== "transfer_reported") {
+        throw Object.assign(new Error("The diner must report the transfer before staff can confirm it."), {
           statusCode: 409,
         });
       }
@@ -1151,6 +1420,11 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
 });
 
 app.post("/finalize-online-payment", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    error: "Diner online payments are temporarily unavailable.",
+  });
+
   const {
     reference,
     restaurantId,
