@@ -145,6 +145,19 @@ const createSessionAccessToken = () => crypto.randomBytes(32).toString("hex");
 const hashSessionAccessToken = (token) =>
   crypto.createHash("sha256").update(String(token || "")).digest("hex");
 const SESSION_IDLE_MS = 4 * 60 * 60 * 1000;
+const EMAIL_OTP_TTL_MS = 10 * 60 * 1000;
+const EMAIL_OTP_MAX_ATTEMPTS = 5;
+
+const normalizeEmail = (email) => String(email || "").trim().toLowerCase();
+const hashValue = (value) =>
+  crypto.createHash("sha256").update(String(value || "")).digest("hex");
+const otpDocumentId = (purpose, email) => `${purpose}_${hashValue(normalizeEmail(email))}`;
+const createOtp = () => String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
+
+const DEFAULT_MONTHLY_FEES = {
+  restaurant: 25000,
+  lounge: 40000,
+};
 
 // 3-day grace period after a trial/subscription lapses — venue keeps working while
 // the owner is nudged to pay; the daily sweep suspends only after grace runs out.
@@ -263,6 +276,14 @@ const verifyPaystackReference = async (reference) => {
   return data.data;
 };
 
+const getSubscriptionPlanCode = (profile) => {
+  const operation = profile.businessType === "lounge" ? "LOUNGE" : "RESTAURANT";
+  const cycle = profile.billingCycle === "yearly" ? "YEARLY" : "MONTHLY";
+  return process.env[`PAYSTACK_${operation}_${cycle}_PLAN_CODE`] || "";
+};
+
+const subscriptionDays = (cycle) => (cycle === "yearly" ? 365 : 30);
+
 // Generate a Firebase email-verification link. Tries to send the user back to the
 // app's /login afterwards; falls back to the default handler if that domain isn't
 // in Firebase's authorized domains yet.
@@ -309,6 +330,27 @@ const sendWelcomeEmail = async (email, name, verifyLink) => {
     from: MAIL_FROM,
     to: [email],
     subject: "Welcome to Servrr — verify your email",
+    html,
+  });
+};
+
+const sendOtpEmail = async ({ email, code, purpose }) => {
+  const heading = purpose === "password_reset" ? "Reset your password" : "Verify your email";
+  const detail = purpose === "password_reset"
+    ? "Use this code to choose a new Servrr password."
+    : "Use this code to continue setting up your Servrr workspace.";
+  const html = `
+    <div style="background:#fffaf5;font-family:Georgia,'Times New Roman',serif;max-width:480px;margin:0 auto;padding:40px 28px;color:#191511;">
+      <p style="color:#f76b00;font-size:28px;font-weight:700;margin:0 0 32px;">Servrr</p>
+      <h1 style="font-size:28px;line-height:1.15;margin:0 0 12px;">${heading}</h1>
+      <p style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#685f57;font-size:14px;line-height:1.6;margin:0 0 24px;">${detail}</p>
+      <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:10px;color:#191511;font-size:30px;font-weight:800;background:#fff;border:1px solid #f0ded0;border-radius:14px;padding:18px 20px;text-align:center;">${code}</div>
+      <p style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#8a8179;font-size:12px;line-height:1.6;margin:24px 0 0;">This code expires in 10 minutes. If you did not request it, you can ignore this email.</p>
+    </div>`;
+  await resend.emails.send({
+    from: MAIL_FROM,
+    to: [email],
+    subject: `${code} is your Servrr verification code`,
     html,
   });
 };
@@ -438,6 +480,158 @@ const runSubscriptionSweep = async () => {
 setTimeout(runSubscriptionSweep, 30_000).unref?.();
 setInterval(runSubscriptionSweep, 6 * 60 * 60 * 1000).unref?.();
 
+// ── Public setup and email verification ──────────────────────────────────────
+// Signup is intentionally verified before Firebase Auth creates an account. This
+// avoids abandoned/unverified users and binds the verified email to the invite.
+app.post("/setup-requests", rateLimit({ windowMs: 15 * 60_000, max: 10 }), async (req, res) => {
+  const name = String(req.body?.name || "").trim().slice(0, 120);
+  const businessName = String(req.body?.businessName || "").trim().slice(0, 160);
+  const email = normalizeEmail(req.body?.email);
+  const phone = String(req.body?.phone || "").trim().slice(0, 40);
+  const operatingMode = req.body?.operatingMode === "lounge" ? "lounge" : "restaurant";
+  const needs = String(req.body?.needs || "").trim().slice(0, 1500);
+  if (!name || !businessName || !email || !phone) {
+    return res.status(400).json({ error: "Name, business name, email, and phone are required." });
+  }
+  if (!/^\S+@\S+\.\S+$/.test(email)) {
+    return res.status(400).json({ error: "Enter a valid email address." });
+  }
+
+  try {
+    const ref = await db.collection("setupRequests").add({
+      name,
+      businessName,
+      email,
+      phone,
+      operatingMode,
+      needs,
+      status: "new",
+      createdAt: FieldValue.serverTimestamp(),
+      reviewedAt: null,
+      reviewedByUid: null,
+      inviteCodeId: null,
+    });
+    return res.status(201).json({ success: true, requestId: ref.id });
+  } catch (err) {
+    console.error("Setup request error:", err);
+    return res.status(500).json({ error: "Could not submit your setup request." });
+  }
+});
+
+app.post("/auth/request-otp", rateLimit({ windowMs: 15 * 60_000, max: 10 }), async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const purpose = req.body?.purpose === "password_reset" ? "password_reset" : "signup";
+  const inviteCode = String(req.body?.inviteCode || "").trim().toUpperCase();
+  if (!/^\S+@\S+\.\S+$/.test(email)) {
+    return res.status(400).json({ error: "Enter a valid email address." });
+  }
+  if (purpose === "signup" && !inviteCode) {
+    return res.status(400).json({ error: "An invite code is required." });
+  }
+
+  try {
+    if (purpose === "signup") {
+      const inviteSnap = await db.collection("inviteCodes")
+        .where("code", "==", inviteCode)
+        .where("status", "==", "unused")
+        .limit(1)
+        .get();
+      if (inviteSnap.empty || isExpiredTimestamp(inviteSnap.docs[0].data().expiresAt)) {
+        return res.status(400).json({ error: "That invite code is invalid or has expired." });
+      }
+    } else {
+      // Keep the response generic so this endpoint cannot be used to enumerate accounts.
+      try {
+        await admin.auth().getUserByEmail(email);
+      } catch (_) {
+        return res.json({ success: true, expiresInSeconds: EMAIL_OTP_TTL_MS / 1000 });
+      }
+    }
+
+    const code = createOtp();
+    const now = Date.now();
+    await db.doc(`emailOtps/${otpDocumentId(purpose, email)}`).set({
+      purpose,
+      emailHash: hashValue(email),
+      codeHash: hashValue(`${purpose}:${email}:${code}`),
+      inviteCode: purpose === "signup" ? inviteCode : null,
+      attempts: 0,
+      expiresAt: new Date(now + EMAIL_OTP_TTL_MS),
+      createdAt: FieldValue.serverTimestamp(),
+      verifiedAt: null,
+      verificationTokenHash: null,
+    });
+    await sendOtpEmail({ email, code, purpose });
+    return res.json({ success: true, expiresInSeconds: EMAIL_OTP_TTL_MS / 1000 });
+  } catch (err) {
+    console.error("OTP request error:", err);
+    return res.status(500).json({ error: "Could not send a verification code. Please try again." });
+  }
+});
+
+app.post("/auth/verify-otp", rateLimit({ windowMs: 15 * 60_000, max: 20 }), async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const purpose = req.body?.purpose === "password_reset" ? "password_reset" : "signup";
+  const code = String(req.body?.code || "").replace(/\D/g, "");
+  if (!/^\S+@\S+\.\S+$/.test(email) || code.length !== 6) {
+    return res.status(400).json({ error: "Enter the six-digit code from your email." });
+  }
+
+  try {
+    const otpRef = db.doc(`emailOtps/${otpDocumentId(purpose, email)}`);
+    const verificationToken = crypto.randomBytes(32).toString("hex");
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(otpRef);
+      const record = snap.exists ? snap.data() : null;
+      if (!record || isExpiredTimestamp(record.expiresAt)) {
+        throw Object.assign(new Error("That code has expired. Request a new one."), { statusCode: 400 });
+      }
+      if (Number(record.attempts || 0) >= EMAIL_OTP_MAX_ATTEMPTS) {
+        throw Object.assign(new Error("Too many incorrect attempts. Request a new code."), { statusCode: 429 });
+      }
+      if (record.codeHash !== hashValue(`${purpose}:${email}:${code}`)) {
+        tx.update(otpRef, { attempts: FieldValue.increment(1) });
+        throw Object.assign(new Error("That code is incorrect."), { statusCode: 400 });
+      }
+      tx.update(otpRef, {
+        codeHash: null,
+        attempts: FieldValue.increment(1),
+        verifiedAt: FieldValue.serverTimestamp(),
+        verificationTokenHash: hashValue(verificationToken),
+        verificationExpiresAt: new Date(Date.now() + EMAIL_OTP_TTL_MS),
+      });
+    });
+    return res.json({ success: true, verificationToken });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not verify that code." });
+  }
+});
+
+app.post("/auth/reset-password", rateLimit({ windowMs: 15 * 60_000, max: 10 }), async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const verificationToken = String(req.body?.verificationToken || "");
+  const password = String(req.body?.password || "");
+  if (!/^\S+@\S+\.\S+$/.test(email) || !verificationToken || password.length < 8) {
+    return res.status(400).json({ error: "Use a verified code and a password with at least 8 characters." });
+  }
+  try {
+    const otpRef = db.doc(`emailOtps/${otpDocumentId("password_reset", email)}`);
+    const otpSnap = await otpRef.get();
+    const otp = otpSnap.exists ? otpSnap.data() : null;
+    if (!otp || otp.verificationTokenHash !== hashValue(verificationToken) || isExpiredTimestamp(otp.verificationExpiresAt)) {
+      return res.status(403).json({ error: "Verify a new email code before resetting your password." });
+    }
+    const user = await admin.auth().getUserByEmail(email);
+    await admin.auth().updateUser(user.uid, { password });
+    await admin.auth().revokeRefreshTokens(user.uid);
+    await otpRef.update({ verificationTokenHash: null, usedAt: FieldValue.serverTimestamp() });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Password reset error:", err);
+    return res.status(500).json({ error: "Could not reset your password. Please try again." });
+  }
+});
+
 app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requireFirebaseUser, async (req, res) => {
   const {
     inviteCode,
@@ -453,27 +647,20 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
     contactEmail,
     instagram,
     twitter,
+    verificationToken,
   } = req.body || {};
 
   const email = req.firebaseUser.email;
   const uid = req.firebaseUser.uid;
   const restaurantId = slugify(name);
   const selectedPaymentMode = normalizePaymentMode(paymentMode);
-  // Only restaurant/lounge are sellable today; anything else (incl. "hotel") falls back to restaurant.
-  const selectedBusinessType =
-    businessType === "lounge" ? "lounge" : "restaurant";
+  const requestedBusinessType = businessType === "lounge" ? "lounge" : "restaurant";
 
   if (!inviteCode || !name || !restaurantId || !email) {
     return res
       .status(400)
       .json({ error: "Invite code, restaurant name, and email are required." });
   }
-  if (!address || !phone || !contactEmail) {
-    return res
-      .status(400)
-      .json({ error: "Address, phone, and contact email are required." });
-  }
-
   try {
     const result = await db.runTransaction(async (tx) => {
       const userRef = db.doc(`users/${uid}`);
@@ -484,10 +671,12 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
         .where("status", "==", "unused")
         .limit(1);
 
-      const [userSnap, profileSnap, inviteSnap] = await Promise.all([
+      const otpRef = db.doc(`emailOtps/${otpDocumentId("signup", email)}`);
+      const [userSnap, profileSnap, inviteSnap, otpSnap] = await Promise.all([
         tx.get(userRef),
         tx.get(profileRef),
         tx.get(inviteQuery),
+        tx.get(otpRef),
       ]);
 
       if (userSnap.exists) {
@@ -510,6 +699,17 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
         });
       }
 
+      const otp = otpSnap.exists ? otpSnap.data() : null;
+      if (
+        !verificationToken ||
+        !otp ||
+        otp.inviteCode !== String(inviteCode).trim().toUpperCase() ||
+        otp.verificationTokenHash !== hashValue(verificationToken) ||
+        isExpiredTimestamp(otp.verificationExpiresAt)
+      ) {
+        throw Object.assign(new Error("Verify your email before completing signup."), { statusCode: 403 });
+      }
+
       const inviteDoc = inviteSnap.docs[0];
       const inviteData = inviteDoc.data();
       if (isExpiredTimestamp(inviteData.expiresAt)) {
@@ -520,6 +720,17 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
 
       const trialEndsAt = new Date();
       trialEndsAt.setDate(trialEndsAt.getDate() + 7);
+
+      // Operational mode and commercial terms come from the approved invite,
+      // not from browser-submitted signup data.
+      const selectedBusinessType = inviteData.operatingMode === "lounge"
+        ? "lounge"
+        : requestedBusinessType;
+      const planKind = inviteData.planKind === "custom" ? "custom" : "standard";
+      const customMonthlyFee = Number(inviteData.monthlyFee);
+      const monthlyFee = planKind === "custom" && Number.isFinite(customMonthlyFee) && customMonthlyFee > 0
+        ? customMonthlyFee
+        : DEFAULT_MONTHLY_FEES[selectedBusinessType];
 
       tx.set(userRef, {
         restaurantId,
@@ -534,6 +745,8 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
         name: String(name).trim(),
         email,
         businessType: selectedBusinessType,
+        planKind,
+        monthlyFee,
         accentColor: accentColor || "#fa5631",
         tagline: tagline || "",
         description: description || "",
@@ -559,18 +772,16 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
         usedByUid: uid,
         usedAt: FieldValue.serverTimestamp(),
       });
+      tx.update(otpRef, {
+        verificationTokenHash: null,
+        usedAt: FieldValue.serverTimestamp(),
+      });
 
       return { restaurantId };
     });
 
-    // Send the branded welcome + verification email — non-blocking (don't fail
-    // signup if email delivery has a hiccup; the login page can resend).
-    try {
-      const verifyLink = await genVerifyLink(email);
-      await sendWelcomeEmail(email, name, verifyLink);
-    } catch (mailErr) {
-      console.error("Welcome email failed:", mailErr);
-    }
+    // The OTP proves control of this email, so mark the Firebase account verified.
+    await admin.auth().updateUser(uid, { emailVerified: true });
 
     return res.json({ success: true, ...result });
   } catch (err) {
@@ -698,6 +909,50 @@ app.post("/create-subaccount", rateLimit({ windowMs: 60_000, max: 10 }), require
   }
 });
 
+// POST /subscription-checkout — creates the first Paystack charge for a Servrr
+// subscription. The attached Paystack plan creates subsequent automatic renewals.
+app.post("/subscription-checkout", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  if (!restaurantId) return res.status(400).json({ error: "restaurantId is required." });
+  try {
+    if (!(await userCanManage(req.firebaseUser.uid, restaurantId))) {
+      return res.status(403).json({ error: "Not authorized for this restaurant." });
+    }
+    const profileRef = db.doc(`restaurants/${restaurantId}/profile/info`);
+    const profileSnap = await profileRef.get();
+    if (!profileSnap.exists) return res.status(404).json({ error: "Restaurant profile not found." });
+    const profile = profileSnap.data();
+    if (profile.planKind === "custom") {
+      return res.status(409).json({ error: "Your Custom plan is activated by the Servrr team. Please contact support." });
+    }
+    const planCode = getSubscriptionPlanCode(profile);
+    if (!planCode) {
+      return res.status(503).json({ error: "Subscription billing is not configured yet. Please contact support." });
+    }
+    const response = await fetch("https://api.paystack.co/transaction/initialize", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        email: req.firebaseUser.email || profile.email,
+        plan: planCode,
+        callback_url: `${APP_URL}/${encodeURIComponent(restaurantId)}/admin?subscription=complete`,
+        metadata: { restaurantId, purpose: "servrr_subscription" },
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.status || !payload.data?.authorization_url) {
+      return res.status(502).json({ error: payload.message || "Could not start subscription checkout." });
+    }
+    return res.json({ authorizationUrl: payload.data.authorization_url });
+  } catch (err) {
+    console.error("Subscription checkout error:", err);
+    return res.status(500).json({ error: "Could not start subscription checkout." });
+  }
+});
+
 app.post("/verify-payment", async (req, res) => {
   const { reference } = req.body;
   if (!reference || typeof reference !== "string") {
@@ -744,6 +999,37 @@ app.post("/paystack-webhook", async (req, res) => {
 
   try {
     const metadata = transaction.metadata || {};
+    // The first successful charge activates the venue and Paystack keeps the
+    // subscription authorization for later monthly/annual renewals.
+    if (metadata.purpose === "servrr_subscription" && metadata.restaurantId && event.event === "charge.success") {
+      const profileRef = db.doc(`restaurants/${metadata.restaurantId}/profile/info`);
+      const profileSnap = await profileRef.get();
+      if (profileSnap.exists) {
+        const profile = profileSnap.data();
+        const now = new Date();
+        const currentUntil = profile.subscriptionPaidUntil?.toDate?.() || null;
+        const base = currentUntil && currentUntil > now ? currentUntil : now;
+        const paidUntil = new Date(base);
+        paidUntil.setDate(paidUntil.getDate() + subscriptionDays(profile.billingCycle));
+        await profileRef.update({
+          subscriptionStatus: "active",
+          subscriptionPaidUntil: paidUntil,
+          suspended: false,
+          suspendedReason: null,
+          lastSubscriptionPaymentAt: FieldValue.serverTimestamp(),
+        });
+        await db.collection(`restaurants/${metadata.restaurantId}/billing`).add({
+          date: FieldValue.serverTimestamp(),
+          type: profile.businessType || "restaurant",
+          planKind: profile.planKind || "standard",
+          cycle: profile.billingCycle || "monthly",
+          amount: Number(transaction.amount || 0) / 100,
+          status: "paid",
+          reference: transaction.reference || null,
+          source: "paystack_subscription",
+        });
+      }
+    }
     await db.doc(`paymentReferences/${reference}`).set(
       {
         reference,
