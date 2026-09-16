@@ -200,6 +200,29 @@ const SUPER_ADMIN_UID = "vqjNAPsGMyUjVL7PMIg3cBNSQhS2";
 const OPS_ROLES = ["owner", "manager", "admin", "staff", "kitchen", "bar", "waiter", "cashier"];
 const MANAGE_ROLES = ["owner", "manager", "admin"];
 
+const paymentRevenueField = (paidVia) =>
+  ({
+    cash: "cashRevenue",
+    pos: "posRevenue",
+    transfer: "transferRevenue",
+    online: "onlineRevenue",
+  })[paidVia] || "otherRevenue";
+
+// Revenue is reported against the venue's operating day, not UTC. Servrr's
+// current market is Nigeria, so the reconciliation key follows Lagos time.
+const lagosDayKey = (value = new Date()) => {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Africa/Lagos",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(value));
+  const values = Object.fromEntries(
+    parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]),
+  );
+  return `${values.year}-${values.month}-${values.day}`;
+};
+
 // Escape user-supplied strings before interpolating into HTML emails.
 const escapeHtml = (value) =>
   String(value ?? "")
@@ -1664,6 +1687,26 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
         { merge: true },
       );
 
+      const settledOrderCount = orderSnaps.filter(
+        (snap) => snap.exists && snap.data().status !== "cancelled",
+      ).length;
+      const dayKey = lagosDayKey();
+      // One session can only transition to paid once, so this transaction is an
+      // idempotent source of truth for the daily reconciliation rollup.
+      tx.set(
+        db.doc(`restaurants/${restaurantId}/dailySummaries/${dayKey}`),
+        {
+          dateKey: dayKey,
+          totalRevenue: FieldValue.increment(total),
+          [paymentRevenueField(paidVia)]: FieldValue.increment(total),
+          settledTables: FieldValue.increment(1),
+          settledOrders: FieldValue.increment(settledOrderCount),
+          lastSettlementAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
       // Receipt bills are grouped per guest: same email = one bill, different
       // guests (email, else name) stay separate.
       const groups = new Map();
@@ -1702,6 +1745,81 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
     return res.status(err.statusCode || 500).json({
       error: err.message || "Could not close table session.",
     });
+  }
+});
+
+// POST /rebuild-daily-summaries — management-only historical backfill. This is
+// intentionally manual: the dashboard always reads tiny pre-aggregated docs,
+// never every historical order/session.
+app.post("/rebuild-daily-summaries", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const requestedDays = Number(req.body?.days || 7);
+  const days = Math.max(1, Math.min(90, Number.isFinite(requestedDays) ? requestedDays : 7));
+
+  if (!restaurantId) {
+    return res.status(400).json({ error: "restaurantId is required" });
+  }
+
+  try {
+    if (!(await userCanManage(req.firebaseUser.uid, restaurantId))) {
+      return res.status(403).json({ error: "Not authorized for this restaurant" });
+    }
+
+    const start = new Date();
+    start.setDate(start.getDate() - (days - 1));
+    start.setHours(0, 0, 0, 0);
+    const sessions = await db
+      .collection(`restaurants/${restaurantId}/tableSessions`)
+      .where("closedAt", ">=", start)
+      .get();
+    const totals = new Map();
+
+    sessions.forEach((snap) => {
+      const session = snap.data();
+      if (session.status !== "paid") return;
+      const total = Number(session.totalBill);
+      if (!Number.isFinite(total) || total < 0) return;
+
+      const dayKey = lagosDayKey(toMillis(session.closedAt));
+      const current = totals.get(dayKey) || {
+        totalRevenue: 0,
+        cashRevenue: 0,
+        posRevenue: 0,
+        transferRevenue: 0,
+        onlineRevenue: 0,
+        otherRevenue: 0,
+        settledTables: 0,
+        settledOrders: 0,
+      };
+      current.totalRevenue += total;
+      current[paymentRevenueField(session.paidVia)] += total;
+      current.settledTables += 1;
+      current.settledOrders += Array.isArray(session.orderIds) ? session.orderIds.length : 0;
+      totals.set(dayKey, current);
+    });
+
+    const writes = [...totals.entries()];
+    for (let index = 0; index < writes.length; index += 450) {
+      const batch = db.batch();
+      writes.slice(index, index + 450).forEach(([dayKey, data]) => {
+        batch.set(
+          db.doc(`restaurants/${restaurantId}/dailySummaries/${dayKey}`),
+          {
+            dateKey: dayKey,
+            ...data,
+            rebuiltAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      });
+      await batch.commit();
+    }
+
+    return res.json({ success: true, days, summariesUpdated: writes.length });
+  } catch (err) {
+    console.error("Rebuild daily summaries error:", err);
+    return res.status(500).json({ error: "Could not rebuild daily summaries." });
   }
 });
 
