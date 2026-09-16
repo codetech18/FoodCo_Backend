@@ -1654,7 +1654,7 @@ app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
       orderSnaps.forEach((snap) => {
         // Cancelled orders were never paid for — leave them out of the settlement.
         if (snap.exists && snap.data().status !== "cancelled") {
-          tx.update(snap.ref, { paymentStatus: "paid" });
+          tx.update(snap.ref, { paymentStatus: "paid", paidVia });
         }
       });
 
