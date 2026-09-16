@@ -815,6 +815,102 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
   }
 });
 
+// POST /restore-restaurant-profile — recover the minimal profile document when
+// a venue's parent/profile document was accidentally removed in Firestore.
+// This intentionally does not recreate menu items, orders, or other deleted data.
+app.post(
+  "/restore-restaurant-profile",
+  rateLimit({ windowMs: 15 * 60_000, max: 10 }),
+  requireFirebaseUser,
+  async (req, res) => {
+    const restaurantId = String(req.body?.restaurantId || "")
+      .trim()
+      .toLowerCase();
+    const requestedName = String(req.body?.name || "").trim().slice(0, 100);
+
+    if (!/^[a-z0-9-]{2,80}$/.test(restaurantId)) {
+      return res.status(400).json({ error: "Enter a valid workspace ID." });
+    }
+
+    try {
+      const uid = req.firebaseUser.uid;
+      const superAdmin = await isSuperAdmin(uid);
+      const result = await db.runTransaction(async (tx) => {
+        const userRef = db.doc(`users/${uid}`);
+        const profileRef = db.doc(`restaurants/${restaurantId}/profile/info`);
+        const restaurantRef = db.doc(`restaurants/${restaurantId}`);
+        const [userSnap, profileSnap] = await Promise.all([
+          tx.get(userRef),
+          tx.get(profileRef),
+        ]);
+
+        if (!userSnap.exists) {
+          throw Object.assign(new Error("Your owner account record could not be found."), {
+            statusCode: 404,
+          });
+        }
+
+        const userData = userSnap.data();
+        const ownerCanRecover =
+          userData.restaurantId === restaurantId &&
+          (!userData.role || userData.role === "owner");
+        if (!superAdmin && !ownerCanRecover) {
+          throw Object.assign(
+            new Error("Only the original owner can recover this workspace."),
+            { statusCode: 403 },
+          );
+        }
+
+        if (profileSnap.exists) {
+          return { restored: false, restaurantId };
+        }
+
+        const name = requestedName || userData.restaurantName || restaurantId;
+        const email = userData.email || req.firebaseUser.email || "";
+
+        // Keep this profile deliberately minimal. With no commercial fields it is
+        // treated as a legacy active venue, avoiding accidental trial expiry.
+        tx.set(profileRef, {
+          restaurantId,
+          ownerUid: uid,
+          name,
+          email,
+          contactEmail: email,
+          accentColor: "#fa5631",
+          paymentMode: "at_table",
+          paymentPreference: "at_table",
+          suspended: false,
+          recoveredAt: FieldValue.serverTimestamp(),
+          recoveryVersion: 1,
+        });
+        tx.set(
+          restaurantRef,
+          {
+            restoredParent: true,
+            restoredAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        // Older owner records may not contain a role, which would otherwise
+        // make Firestore rules reject every dashboard query after recovery.
+        if (!userData.role) {
+          tx.set(userRef, { role: "owner" }, { merge: true });
+        }
+
+        return { restored: true, restaurantId };
+      });
+
+      return res.json({ success: true, ...result });
+    } catch (err) {
+      console.error("Restaurant profile recovery error:", err);
+      return res.status(err.statusCode || 500).json({
+        error: err.message || "The workspace profile could not be restored.",
+      });
+    }
+  },
+);
+
 // POST /resend-verification — re-send the branded verification email to the signed-in user.
 app.post(
   "/resend-verification",
