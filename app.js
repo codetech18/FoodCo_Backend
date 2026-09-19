@@ -904,14 +904,56 @@ app.post(
         return res.status(409).json({ error: "Restore the workspace profile before recovering its data." });
       }
 
-      const [legacyMenu, legacyOrders, currentMenu, currentOrders] = await Promise.all([
-        db.collection("menu").get(),
-        db.collection("orders").get(),
-        db.collection(`restaurants/${restaurantId}/menu`).get(),
-        db.collection(`restaurants/${restaurantId}/orders`).get(),
-      ]);
+      // Deleting a Firestore parent document does not delete its subcollections.
+      // Scan those subcollections as well as the original root collections so
+      // data from an older restaurant ID can be recovered after the profile is
+      // recreated.
+      const [legacyMenu, legacyOrders, allMenu, allOrders, profiles, currentMenu, currentOrders] =
+        await Promise.all([
+          db.collection("menu").get(),
+          db.collection("orders").get(),
+          db.collectionGroup("menu").get(),
+          db.collectionGroup("orders").get(),
+          db.collectionGroup("profile").get(),
+          db.collection(`restaurants/${restaurantId}/menu`).get(),
+          db.collection(`restaurants/${restaurantId}/orders`).get(),
+        ]);
 
-      if (legacyMenu.empty && legacyOrders.empty) {
+      const relatedRestaurantIds = new Set([restaurantId]);
+      const normalizedUserEmail = String(req.firebaseUser.email || "").trim().toLowerCase();
+      for (const profile of profiles.docs) {
+        const data = profile.data() || {};
+        const profileEmail = String(data.email || data.contactEmail || "").trim().toLowerCase();
+        if (data.ownerUid === uid || (normalizedUserEmail && profileEmail === normalizedUserEmail)) {
+          const parts = profile.ref.path.split("/");
+          if (parts[0] === "restaurants" && parts[2] === "profile") {
+            relatedRestaurantIds.add(parts[1]);
+          }
+        }
+      }
+
+      const sourceRecords = (rootSnapshot, groupSnapshot, collectionName) => {
+        const records = new Map();
+        for (const snapshot of rootSnapshot.docs) {
+          records.set(`${collectionName}/${snapshot.id}`, snapshot);
+        }
+        for (const snapshot of groupSnapshot.docs) {
+          const parts = snapshot.ref.path.split("/");
+          const sourceRestaurantId = parts[0] === "restaurants" ? parts[1] : null;
+          if (
+            sourceRestaurantId &&
+            parts[2] === collectionName &&
+            (relatedRestaurantIds.has(sourceRestaurantId) || snapshot.data()?.restaurantId === restaurantId)
+          ) {
+            records.set(snapshot.ref.path, snapshot);
+          }
+        }
+        return [...records.values()];
+      };
+
+      const legacyMenuRecords = sourceRecords(legacyMenu, allMenu, "menu");
+      const legacyOrderRecords = sourceRecords(legacyOrders, allOrders, "orders");
+      if (legacyMenuRecords.length === 0 && legacyOrderRecords.length === 0) {
         return res.status(404).json({ error: "No legacy menu or transaction records were found." });
       }
 
@@ -919,7 +961,7 @@ app.post(
       const currentOrderIds = new Set(currentOrders.docs.map((snapshot) => snapshot.id));
       const pendingWrites = [];
 
-      for (const snapshot of legacyMenu.docs) {
+      for (const snapshot of legacyMenuRecords) {
         if (currentMenuIds.has(snapshot.id)) continue;
         pendingWrites.push({
           ref: db.doc(`restaurants/${restaurantId}/menu/${snapshot.id}`),
@@ -927,7 +969,7 @@ app.post(
           type: "menu",
         });
       }
-      for (const snapshot of legacyOrders.docs) {
+      for (const snapshot of legacyOrderRecords) {
         if (currentOrderIds.has(snapshot.id)) continue;
         pendingWrites.push({
           ref: db.doc(`restaurants/${restaurantId}/orders/${snapshot.id}`),
@@ -952,8 +994,8 @@ app.post(
       await db.doc(`restaurants/${restaurantId}/profile/info`).set(
         {
           legacyDataRecoveredAt: FieldValue.serverTimestamp(),
-          legacyMenuRecovered: legacyMenu.size,
-          legacyOrdersRecovered: legacyOrders.size,
+          legacyMenuRecovered: legacyMenuRecords.length,
+          legacyOrdersRecovered: legacyOrderRecords.length,
         },
         { merge: true },
       );
@@ -963,6 +1005,8 @@ app.post(
         restaurantId,
         menuCopied,
         ordersCopied,
+        menuFound: legacyMenuRecords.length,
+        ordersFound: legacyOrderRecords.length,
         menuAlreadyPresent: currentMenu.size,
         ordersAlreadyPresent: currentOrders.size,
       });
