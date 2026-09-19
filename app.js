@@ -866,6 +866,115 @@ app.post(
   },
 );
 
+// POST /restore-legacy-workspace-data — copies the original single-tenant
+// root collections into the current restaurant-scoped paths. The source data
+// is intentionally retained and existing destination documents are skipped,
+// making the operation safe to retry after a partial migration.
+app.post(
+  "/restore-legacy-workspace-data",
+  rateLimit({ windowMs: 15 * 60_000, max: 5 }),
+  requireFirebaseUser,
+  async (req, res) => {
+    const restaurantId = String(req.body?.restaurantId || "")
+      .trim()
+      .toLowerCase();
+
+    if (!/^[a-z0-9-]{2,80}$/.test(restaurantId)) {
+      return res.status(400).json({ error: "Enter a valid workspace ID." });
+    }
+
+    try {
+      const uid = req.firebaseUser.uid;
+      const [superAdmin, userSnap, profileSnap] = await Promise.all([
+        isSuperAdmin(uid),
+        db.doc(`users/${uid}`).get(),
+        db.doc(`restaurants/${restaurantId}/profile/info`).get(),
+      ]);
+      const userData = userSnap.exists ? userSnap.data() : {};
+      const profileData = profileSnap.exists ? profileSnap.data() : {};
+      const isOriginalOwner =
+        userData.restaurantId === restaurantId &&
+        (userData.role === "owner" || !userData.role) &&
+        (!profileData.ownerUid || profileData.ownerUid === uid);
+
+      if (!superAdmin && !isOriginalOwner) {
+        return res.status(403).json({ error: "Only the workspace owner can recover this data." });
+      }
+      if (!profileSnap.exists) {
+        return res.status(409).json({ error: "Restore the workspace profile before recovering its data." });
+      }
+
+      const [legacyMenu, legacyOrders, currentMenu, currentOrders] = await Promise.all([
+        db.collection("menu").get(),
+        db.collection("orders").get(),
+        db.collection(`restaurants/${restaurantId}/menu`).get(),
+        db.collection(`restaurants/${restaurantId}/orders`).get(),
+      ]);
+
+      if (legacyMenu.empty && legacyOrders.empty) {
+        return res.status(404).json({ error: "No legacy menu or transaction records were found." });
+      }
+
+      const currentMenuIds = new Set(currentMenu.docs.map((snapshot) => snapshot.id));
+      const currentOrderIds = new Set(currentOrders.docs.map((snapshot) => snapshot.id));
+      const pendingWrites = [];
+
+      for (const snapshot of legacyMenu.docs) {
+        if (currentMenuIds.has(snapshot.id)) continue;
+        pendingWrites.push({
+          ref: db.doc(`restaurants/${restaurantId}/menu/${snapshot.id}`),
+          data: snapshot.data(),
+          type: "menu",
+        });
+      }
+      for (const snapshot of legacyOrders.docs) {
+        if (currentOrderIds.has(snapshot.id)) continue;
+        pendingWrites.push({
+          ref: db.doc(`restaurants/${restaurantId}/orders/${snapshot.id}`),
+          data: snapshot.data(),
+          type: "orders",
+        });
+      }
+
+      let menuCopied = 0;
+      let ordersCopied = 0;
+      for (let offset = 0; offset < pendingWrites.length; offset += 400) {
+        const batch = db.batch();
+        const chunk = pendingWrites.slice(offset, offset + 400);
+        for (const write of chunk) {
+          batch.set(write.ref, write.data);
+          if (write.type === "menu") menuCopied += 1;
+          if (write.type === "orders") ordersCopied += 1;
+        }
+        await batch.commit();
+      }
+
+      await db.doc(`restaurants/${restaurantId}/profile/info`).set(
+        {
+          legacyDataRecoveredAt: FieldValue.serverTimestamp(),
+          legacyMenuRecovered: legacyMenu.size,
+          legacyOrdersRecovered: legacyOrders.size,
+        },
+        { merge: true },
+      );
+
+      return res.json({
+        success: true,
+        restaurantId,
+        menuCopied,
+        ordersCopied,
+        menuAlreadyPresent: currentMenu.size,
+        ordersAlreadyPresent: currentOrders.size,
+      });
+    } catch (err) {
+      console.error("Legacy workspace data recovery error:", err);
+      return res.status(500).json({
+        error: "The existing menu and transactions could not be recovered right now.",
+      });
+    }
+  },
+);
+
 // POST /resend-verification — re-send the branded verification email to the signed-in user.
 app.post(
   "/resend-verification",
