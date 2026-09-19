@@ -159,25 +159,11 @@ const DEFAULT_MONTHLY_FEES = {
   lounge: 40000,
 };
 
-// 3-day grace period after a trial/subscription lapses — venue keeps working while
-// the owner is nudged to pay; the daily sweep suspends only after grace runs out.
-const GRACE_MS = 3 * 24 * 60 * 60 * 1000;
-
-// Whether a venue may currently take orders — mirrors the client gating in
-// RestaurantContext so a lapsed/suspended venue can't be ordered from via the API.
+// A venue is operational only after a platform administrator activates it.
+// Billing never expires a live venue automatically; suspension is explicit.
 const isVenueActive = (profile) => {
   if (!profile) return false;
-  if (profile.suspended === true) return false;
-  // Legacy venues created before the subscription system are grandfathered active.
-  const hasSubFields =
-    profile.trialEndsAt ||
-    profile.subscriptionPaidUntil ||
-    profile.plan ||
-    profile.businessType;
-  if (!hasSubFields) return true;
-  const now = Date.now();
-  const lapseAt = Math.max(toMillis(profile.trialEndsAt), toMillis(profile.subscriptionPaidUntil));
-  return now < lapseAt + GRACE_MS;
+  return profile.suspended !== true;
 };
 
 const requireFirebaseUser = async (req, res, next) => {
@@ -243,6 +229,7 @@ const hasRestaurantAccess = async (uid, restaurantId, roles) => {
   if (await isSuperAdmin(uid)) return true;
 
   const profileSnap = await db.doc(`restaurants/${restaurantId}/profile/info`).get();
+  if (!profileSnap.exists || profileSnap.data().suspended === true) return false;
   if (profileSnap.exists && profileSnap.data().ownerUid === uid) return true;
 
   const userSnap = await db.doc(`users/${uid}`).get();
@@ -258,6 +245,88 @@ const userCanOperate = (uid, restaurantId) =>
 // Management only (mirrors canManageRestaurant) — owner/manager/admin.
 const userCanManage = (uid, restaurantId) =>
   hasRestaurantAccess(uid, restaurantId, MANAGE_ROLES);
+
+const cloudinaryPublicIdFromUrl = (value) => {
+  try {
+    const url = new URL(String(value || ""));
+    if (!url.hostname.endsWith("res.cloudinary.com")) return "";
+    const parts = url.pathname.split("/").filter(Boolean);
+    const uploadIndex = parts.indexOf("upload");
+    if (uploadIndex < 0) return "";
+    const assetParts = parts.slice(uploadIndex + 1);
+    while (assetParts[0] && (/^v\d+$/.test(assetParts[0]) || assetParts[0].includes(","))) {
+      assetParts.shift();
+    }
+    return assetParts.join("/").replace(/\.[a-z0-9]+$/i, "");
+  } catch {
+    return "";
+  }
+};
+
+const destroyCloudinaryImage = async (publicId) => {
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const apiKey = process.env.CLOUDINARY_API_KEY;
+  const apiSecret = process.env.CLOUDINARY_API_SECRET;
+  if (!cloudName || !apiKey || !apiSecret) {
+    throw Object.assign(new Error("Cloudinary cleanup is not configured."), { statusCode: 503 });
+  }
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signature = crypto
+    .createHash("sha1")
+    .update(`public_id=${publicId}&timestamp=${timestamp}${apiSecret}`)
+    .digest("hex");
+  const form = new URLSearchParams({
+    public_id: publicId,
+    timestamp: String(timestamp),
+    api_key: apiKey,
+    signature,
+  });
+  const response = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/destroy`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: form,
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || (result.result !== "ok" && result.result !== "not found")) {
+    throw new Error(result.error?.message || "Cloudinary asset cleanup failed.");
+  }
+};
+
+app.post("/delete-restaurant-assets", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim().toLowerCase();
+  if (!/^[a-z0-9-]{2,80}$/.test(restaurantId)) {
+    return res.status(400).json({ error: "Invalid restaurant ID." });
+  }
+  if (!(await isSuperAdmin(req.firebaseUser.uid))) {
+    return res.status(403).json({ error: "Only a super admin can delete restaurant assets." });
+  }
+
+  try {
+    const [menuSnap, profileSnap, privateSnap] = await Promise.all([
+      db.collection(`restaurants/${restaurantId}/menu`).get(),
+      db.doc(`restaurants/${restaurantId}/profile/info`).get(),
+      db.doc(`restaurants/${restaurantId}/profile/private`).get(),
+    ]);
+    const publicIds = new Set();
+    for (const snapshot of [profileSnap, privateSnap, ...menuSnap.docs]) {
+      if (!snapshot.exists) continue;
+      const data = snapshot.data();
+      if (data.imagePublicId) publicIds.add(String(data.imagePublicId));
+      if (data.logoPublicId) publicIds.add(String(data.logoPublicId));
+      const parsedImageId = cloudinaryPublicIdFromUrl(data.imageUrl);
+      const parsedLogoId = cloudinaryPublicIdFromUrl(data.logoUrl);
+      if (parsedImageId) publicIds.add(parsedImageId);
+      if (parsedLogoId) publicIds.add(parsedLogoId);
+    }
+    for (const publicId of publicIds) await destroyCloudinaryImage(publicId);
+    return res.json({ success: true, deleted: publicIds.size });
+  } catch (err) {
+    console.error("Restaurant asset cleanup error:", err);
+    return res.status(err.statusCode || 502).json({
+      error: err.message || "Restaurant assets could not be cleaned up.",
+    });
+  }
+});
 
 const validateOrderItems = (items) => {
   if (!Array.isArray(items) || items.length === 0 || items.length > 100) {
@@ -378,131 +447,6 @@ const sendOtpEmail = async ({ email, code, purpose }) => {
   });
 };
 
-// Small branded template for billing lifecycle emails (trial ending, payment due).
-const sendBillingEmail = async ({ to, subject, heading, message, restaurantId }) => {
-  const html = `
-    <div style="background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:480px;margin:0 auto;padding:40px 28px;">
-      <p style="color:#fa5631;font-size:22px;font-weight:900;letter-spacing:-0.5px;margin:0 0 28px 0;">SERVRR</p>
-      <h1 style="color:#fff;font-size:22px;font-weight:800;margin:0 0 12px 0;">${escapeHtml(heading)}</h1>
-      <p style="color:#aaa;font-size:14px;line-height:1.7;margin:0 0 24px 0;">${message}</p>
-      <a href="${APP_URL}/${encodeURIComponent(restaurantId)}/admin" style="display:inline-block;background:#fa5631;color:#0a0a0a;font-size:14px;font-weight:800;text-decoration:none;padding:14px 32px;border-radius:10px;margin-bottom:24px;">
-        Open my dashboard
-      </a>
-      <p style="color:#555;font-size:12px;line-height:1.6;margin:0;">
-        To pay: reply to this email or message us on WhatsApp — payment is confirmed within 2 hours.
-      </p>
-      <p style="color:#333;font-size:11px;text-align:center;margin-top:32px;">© ${new Date().getFullYear()} SERVRR</p>
-    </div>`;
-  await resend.emails.send({ from: MAIL_FROM, to: [to], subject, html });
-};
-
-// ── Subscription sweep ───────────────────────────────────────────────────────────
-// Runs in-process (Cloud Functions need the Blaze plan): reminds owners 2 days before
-// trial ends, notifies on lapse (grace starts), suspends after grace, and reactivates
-// renewed venues. Idempotent via marker fields on the profile; safe to run repeatedly.
-const TRIAL_REMINDER_MS = 2 * 24 * 60 * 60 * 1000;
-let sweepRunning = false;
-
-const runSubscriptionSweep = async () => {
-  if (sweepRunning) return;
-  sweepRunning = true;
-  try {
-    const usersSnap = await db.collection("users").where("role", "==", "owner").get();
-    const seen = new Set();
-    const now = Date.now();
-
-    for (const userDoc of usersSnap.docs) {
-      const { restaurantId } = userDoc.data();
-      if (!restaurantId || seen.has(restaurantId)) continue;
-      seen.add(restaurantId);
-
-      const profileRef = db.doc(`restaurants/${restaurantId}/profile/info`);
-      const snap = await profileRef.get();
-      if (!snap.exists) continue;
-      const p = snap.data();
-
-      // Legacy venues and manual suspensions are left alone.
-      const hasSubFields = p.trialEndsAt || p.subscriptionPaidUntil || p.plan || p.businessType;
-      if (!hasSubFields) continue;
-      if (p.suspended === true && p.suspendedReason === "manual") continue;
-
-      const ownerEmail = p.email || userDoc.data().email;
-      const trialEnd = toMillis(p.trialEndsAt);
-      const paidUntil = toMillis(p.subscriptionPaidUntil);
-      const lapseAt = Math.max(trialEnd, paidUntil);
-      const inTrial = now < trialEnd;
-      const isPaid = now < paidUntil;
-
-      try {
-        // 1. Trial ending in <= 2 days → one reminder, ever.
-        if (
-          inTrial &&
-          !isPaid &&
-          trialEnd - now <= TRIAL_REMINDER_MS &&
-          !p.trialReminderSentAt &&
-          ownerEmail
-        ) {
-          const daysLeft = Math.max(1, Math.ceil((trialEnd - now) / 86400000));
-          await sendBillingEmail({
-            to: ownerEmail,
-            subject: `Your Servrr trial ends in ${daysLeft} day${daysLeft > 1 ? "s" : ""}`,
-            heading: "Your free trial is almost up",
-            message: `Your trial for <strong style="color:#fff">${escapeHtml(p.name || restaurantId)}</strong> ends in ${daysLeft} day${daysLeft > 1 ? "s" : ""}. Activate your subscription now so your QR ordering keeps running without interruption.`,
-            restaurantId,
-          });
-          await profileRef.update({ trialReminderSentAt: FieldValue.serverTimestamp() });
-        }
-
-        // 2. Just lapsed (grace window) → one notice per lapse (re-arms after each renewal).
-        if (!inTrial && !isPaid && now < lapseAt + GRACE_MS) {
-          if (p.expiryNoticeForLapse !== lapseAt && ownerEmail) {
-            await sendBillingEmail({
-              to: ownerEmail,
-              subject: "Action needed — your Servrr subscription has expired",
-              heading: "Payment due",
-              message: `The subscription for <strong style="color:#fff">${escapeHtml(p.name || restaurantId)}</strong> has expired. Your restaurant keeps working for a 3-day grace period — after that, ordering pauses until payment is confirmed.`,
-              restaurantId,
-            });
-            await profileRef.update({ expiryNoticeForLapse: lapseAt });
-          }
-        }
-
-        // 3. Past grace → suspend.
-        if (!inTrial && !isPaid && now >= lapseAt + GRACE_MS && p.suspended !== true) {
-          await profileRef.update({
-            suspended: true,
-            suspendedReason: "subscription_expired",
-            suspendedAt: FieldValue.serverTimestamp(),
-            subscriptionStatus: "expired",
-          });
-          console.log(`[sweep] suspended ${restaurantId} (lapsed ${new Date(lapseAt).toISOString()})`);
-        }
-
-        // 4. Renewed while auto-suspended → reactivate.
-        if ((inTrial || isPaid) && p.suspended === true && p.suspendedReason === "subscription_expired") {
-          await profileRef.update({
-            suspended: false,
-            suspendedReason: null,
-            subscriptionStatus: isPaid ? "active" : "trial",
-          });
-          console.log(`[sweep] reactivated ${restaurantId}`);
-        }
-      } catch (err) {
-        console.error(`[sweep] error for ${restaurantId}:`, err);
-      }
-    }
-  } catch (err) {
-    console.error("[sweep] failed:", err);
-  } finally {
-    sweepRunning = false;
-  }
-};
-
-// Kick off shortly after boot (Render restarts often, so boot-time runs keep it fresh),
-// then every 6 hours while the instance is awake.
-setTimeout(runSubscriptionSweep, 30_000).unref?.();
-setInterval(runSubscriptionSweep, 6 * 60 * 60 * 1000).unref?.();
-
 // ── Public setup and email verification ──────────────────────────────────────
 // Signup is intentionally verified before Firebase Auth creates an account. This
 // avoids abandoned/unverified users and binds the verified email to the invite.
@@ -512,6 +456,7 @@ app.post("/setup-requests", rateLimit({ windowMs: 15 * 60_000, max: 10 }), async
   const email = normalizeEmail(req.body?.email);
   const phone = String(req.body?.phone || "").trim().slice(0, 40);
   const operatingMode = req.body?.operatingMode === "lounge" ? "lounge" : "restaurant";
+  const planKind = req.body?.planKind === "custom" ? "custom" : "standard";
   const needs = String(req.body?.needs || "").trim().slice(0, 1500);
   if (!name || !businessName || !email || !phone) {
     return res.status(400).json({ error: "Name, business name, email, and phone are required." });
@@ -527,6 +472,7 @@ app.post("/setup-requests", rateLimit({ windowMs: 15 * 60_000, max: 10 }), async
       email,
       phone,
       operatingMode,
+      planKind,
       needs,
       status: "new",
       createdAt: FieldValue.serverTimestamp(),
@@ -665,6 +611,7 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
     tagline,
     description,
     logoUrl,
+    logoPublicId,
     address,
     phone,
     contactEmail,
@@ -678,6 +625,17 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
   const restaurantId = slugify(name);
   const selectedPaymentMode = normalizePaymentMode(paymentMode);
   const requestedBusinessType = businessType === "lounge" ? "lounge" : "restaurant";
+  // Firestore rejects undefined values. Optional profile details are persisted as
+  // empty strings until the venue adds them in Settings.
+  const profileAddress = typeof address === "string" ? address.trim() : "";
+  const profilePhone = typeof phone === "string" ? phone.trim() : "";
+  const profileContactEmail = typeof contactEmail === "string" && contactEmail.trim()
+    ? contactEmail.trim().toLowerCase()
+    : email;
+  const profileInstagram = typeof instagram === "string" ? instagram.trim() : "";
+  const profileTwitter = typeof twitter === "string" ? twitter.trim() : "";
+  const profileLogoUrl = typeof logoUrl === "string" ? logoUrl.trim() : "";
+  const profileLogoPublicId = typeof logoPublicId === "string" ? logoPublicId.trim() : "";
 
   if (!inviteCode || !name || !restaurantId || !email) {
     return res
@@ -741,9 +699,6 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
         });
       }
 
-      const trialEndsAt = new Date();
-      trialEndsAt.setDate(trialEndsAt.getDate() + 7);
-
       // Operational mode and commercial terms come from the approved invite,
       // not from browser-submitted signup data.
       const selectedBusinessType = inviteData.operatingMode === "lounge"
@@ -773,19 +728,19 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
         accentColor: accentColor || "#fa5631",
         tagline: tagline || "",
         description: description || "",
-        logoUrl: logoUrl || "",
-        address,
-        phone,
-        contactEmail,
-        instagram: instagram || "",
-        twitter: twitter || "",
+        logoUrl: profileLogoUrl,
+        logoPublicId: profileLogoPublicId,
+        address: profileAddress,
+        phone: profilePhone,
+        contactEmail: profileContactEmail,
+        instagram: profileInstagram,
+        twitter: profileTwitter,
         paymentPreference: selectedPaymentMode,
         paymentMode: selectedPaymentMode,
         paymentModeUpdatedAt: FieldValue.serverTimestamp(),
-        subscriptionStatus: "trial",
-        trialEndsAt,
-        subscriptionPaidUntil: null,
-        suspended: false,
+        subscriptionStatus: "payment_pending",
+        suspended: true,
+        suspendedReason: "payment_pending",
         createdAt: FieldValue.serverTimestamp(),
       });
 
@@ -868,8 +823,8 @@ app.post(
         const name = requestedName || userData.restaurantName || restaurantId;
         const email = userData.email || req.firebaseUser.email || "";
 
-        // Keep this profile deliberately minimal. With no commercial fields it is
-        // treated as a legacy active venue, avoiding accidental trial expiry.
+        // Keep this profile deliberately minimal. Recovered workspaces remain active
+        // unless a platform administrator explicitly suspends them.
         tx.set(profileRef, {
           restaurantId,
           ownerUid: uid,
