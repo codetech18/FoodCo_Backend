@@ -1593,6 +1593,204 @@ app.post("/place-order", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
   }
 });
 
+// POST /staff-place-order — authenticated counter/waiter order entry for guests
+// who are not ordering from their own phone. The server creates or reuses the
+// table session, validates live menu prices, and records a private audit trail.
+app.post(
+  "/staff-place-order",
+  rateLimit({ windowMs: 60_000, max: 40 }),
+  requireFirebaseUser,
+  async (req, res) => {
+    const restaurantId = String(req.body?.restaurantId || "").trim();
+    const table = String(req.body?.table || "").trim().slice(0, 40);
+    const customerName = String(req.body?.customerName || "Walk-in guest")
+      .trim()
+      .slice(0, 120) || "Walk-in guest";
+    const allergies = String(req.body?.allergies || "").trim().slice(0, 500);
+    const requestId = String(req.body?.requestId || "").trim();
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+    if (!restaurantId || !table || !/^[a-zA-Z0-9_-]{12,120}$/.test(requestId)) {
+      return res.status(400).json({ error: "A table and valid order request are required." });
+    }
+    if (!validateOrderItems(items)) {
+      return res.status(400).json({ error: "The order contains invalid items." });
+    }
+
+    try {
+      const uid = req.firebaseUser.uid;
+      if (!(await userCanOperate(uid, restaurantId))) {
+        return res.status(403).json({ error: "You are not authorised to place orders here." });
+      }
+
+      const userSnap = await db.doc(`users/${uid}`).get();
+      const userData = userSnap.exists ? userSnap.data() : {};
+      const actorName = String(
+        userData.name || userData.displayName || req.firebaseUser.name || req.firebaseUser.email || "Staff",
+      ).slice(0, 120);
+
+      const result = await db.runTransaction(async (tx) => {
+        const requestRef = db.doc(
+          `restaurants/${restaurantId}/staffOrderRequests/${requestId}`,
+        );
+        const profileRef = db.doc(`restaurants/${restaurantId}/profile/info`);
+        const tableRef = db.doc(`restaurants/${restaurantId}/tables/${table}`);
+        const [requestSnap, profileSnap, tableSnap] = await Promise.all([
+          tx.get(requestRef),
+          tx.get(profileRef),
+          tx.get(tableRef),
+        ]);
+
+        if (requestSnap.exists) {
+          return { ...requestSnap.data(), duplicate: true };
+        }
+        if (!profileSnap.exists || !isVenueActive(profileSnap.data())) {
+          throw Object.assign(new Error("This restaurant is not accepting orders right now."), {
+            statusCode: 403,
+          });
+        }
+
+        let sessionRef = null;
+        let createdSession = false;
+        const currentSessionId = tableSnap.exists
+          ? tableSnap.data().currentSessionId || null
+          : null;
+        if (currentSessionId) {
+          const currentRef = db.doc(
+            `restaurants/${restaurantId}/tableSessions/${currentSessionId}`,
+          );
+          const currentSnap = await tx.get(currentRef);
+          if (currentSnap.exists) {
+            const current = currentSnap.data();
+            if (current.status === "open") {
+              sessionRef = currentRef;
+            } else if (["awaiting_payment", "transfer_reported"].includes(current.status)) {
+              throw Object.assign(
+                new Error(`Table ${table} has an unsettled bill. Close it before starting another order.`),
+                { statusCode: 409 },
+              );
+            }
+          }
+        }
+
+        const menuSnap = await tx.get(
+          db.collection(`restaurants/${restaurantId}/menu`),
+        );
+        const menuByName = new Map(
+          menuSnap.docs.map((menuDoc) => [
+            String(menuDoc.data().name || "").trim(),
+            menuDoc.data(),
+          ]),
+        );
+        const verifiedItems = items.map((item) => {
+          const menuItem = menuByName.get(String(item.name || "").trim());
+          if (!menuItem || menuItem.available === false) {
+            throw Object.assign(
+              new Error(`${item.name || "An item"} is no longer available.`),
+              { statusCode: 409 },
+            );
+          }
+          const price = Number(menuItem.price);
+          if (!Number.isFinite(price)) {
+            throw Object.assign(new Error("A menu item has an invalid price."), {
+              statusCode: 500,
+            });
+          }
+          return {
+            name: String(menuItem.name),
+            price,
+            qty: Number(item.qty),
+            station: menuItem.station === "bar" ? "bar" : "kitchen",
+          };
+        });
+
+        if (!sessionRef) {
+          sessionRef = db.collection(`restaurants/${restaurantId}/tableSessions`).doc();
+          createdSession = true;
+          tx.set(
+            tableRef,
+            {
+              currentSessionId: sessionRef.id,
+              createdAt: tableSnap.exists
+                ? tableSnap.data().createdAt || FieldValue.serverTimestamp()
+                : FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true },
+          );
+        }
+
+        const total = calculateItemsTotal(verifiedItems);
+        const orderRef = db.collection(`restaurants/${restaurantId}/orders`).doc();
+        const auditRef = db.doc(
+          `restaurants/${restaurantId}/orderAudit/${orderRef.id}`,
+        );
+        tx.set(orderRef, {
+          customerName,
+          email: "",
+          table,
+          allergies,
+          items: verifiedItems,
+          total,
+          status: "pending",
+          createdAt: FieldValue.serverTimestamp(),
+          sessionId: sessionRef.id,
+          orderSource: "staff",
+          createdByName: actorName,
+        });
+        tx.set(auditRef, {
+          action: "staff_order_created",
+          orderId: orderRef.id,
+          sessionId: sessionRef.id,
+          actorUid: uid,
+          actorEmail: req.firebaseUser.email || "",
+          actorName,
+          requestId,
+          createdAt: FieldValue.serverTimestamp(),
+        });
+        tx.set(requestRef, {
+          orderId: orderRef.id,
+          sessionId: sessionRef.id,
+          table,
+          total,
+          createdAt: FieldValue.serverTimestamp(),
+        });
+        if (createdSession) {
+          tx.set(sessionRef, {
+            table,
+            status: "open",
+            openedAt: FieldValue.serverTimestamp(),
+            billRequestedAt: null,
+            closedAt: null,
+            totalBill: total,
+            orderIds: [orderRef.id],
+            accessTokens: [],
+            paymentMode: normalizePaymentMode(profileSnap.data()?.paymentMode),
+            paidVia: null,
+            closedByUid: null,
+            updatedAt: FieldValue.serverTimestamp(),
+          });
+        } else {
+          tx.update(sessionRef, {
+            orderIds: FieldValue.arrayUnion(orderRef.id),
+            totalBill: FieldValue.increment(total),
+            updatedAt: FieldValue.serverTimestamp(),
+          });
+        }
+
+        return { orderId: orderRef.id, sessionId: sessionRef.id, table, total };
+      });
+
+      return res.json({ success: true, ...result });
+    } catch (err) {
+      console.error("Staff place order error:", err);
+      return res.status(err.statusCode || 500).json({
+        error: err.message || "The staff order could not be placed.",
+      });
+    }
+  },
+);
+
 // POST /edit-order — recalculate a pending order and adjust the table atomically.
 app.post("/edit-order", rateLimit({ windowMs: 60_000, max: 20 }), async (req, res) => {
   const restaurantId = String(req.body?.restaurantId || "").trim();
