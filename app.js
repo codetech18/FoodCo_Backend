@@ -2866,11 +2866,9 @@ app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
           );
         }
       }
-      const reportedChecks = selectedCheckIds.filter((id) => checkState(session, id).status === "transfer_reported");
-      if (paidVia === "transfer" && (reportedChecks.length === 0 ||
-          (!selectedCheckIds.every((id) => reportedChecks.includes(id)) && selected.length !== unpaid.length))) {
-        throw Object.assign(new Error("A transfer must be reported for this bill. For one payer covering every bill, select all outstanding orders and verify the full amount."), { statusCode: 409 });
-      }
+      // A guest report is an alert, not a prerequisite for a staff member who
+      // has verified the transfer in the bank account. Combined requests still
+      // have to settle every bill in their payment group above.
       const amount = selected.reduce((sum, snap) => sum + Number(snap.data().total || 0), 0);
       const selectedOrderIds = new Set(selected.map((snap) => snap.id));
       const allSettled = selected.length === unpaid.length;
