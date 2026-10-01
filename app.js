@@ -75,7 +75,15 @@ app.use(
   }),
 );
 
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({
+  limit: "25mb",
+  verify: (req, _res, buffer) => {
+    // Paystack signs the exact request bytes. Keep them before JSON parsing so
+    // webhook verification is not affected by whitespace or key ordering.
+    const requestPath = String(req.originalUrl || "").split("?")[0].replace(/\/+$/, "");
+    if (requestPath === "/paystack-webhook") req.rawBody = buffer;
+  },
+}));
 app.use(express.urlencoded({ limit: "25mb" }));
 
 // Baseline security headers for API responses (the frontend's headers live in vercel.json).
@@ -141,6 +149,26 @@ const toMillis = (ts) => {
   return Number.isFinite(d) ? d : 0;
 };
 
+const LEGACY_CHECK_ID = "legacy";
+const OPEN_TABLE_SESSION_STATUSES = ["open", "awaiting_payment", "transfer_reported"];
+const GROUP_PAYMENT_SHARE_MS = 15 * 60 * 1000;
+const validCheckId = (value) => /^c_[a-f0-9]{32}$/.test(String(value || ""));
+const validCheckSecret = (value) => /^[a-f0-9]{64}$/.test(String(value || ""));
+const hashCheckSecret = (value) => crypto.createHash("sha256").update(value).digest("hex");
+const orderCheckId = (order) => order.checkId || LEGACY_CHECK_ID;
+const checkState = (session, checkId) => session.checks?.[checkId] || {
+  status: checkId === LEGACY_CHECK_ID && !session.checks?.[checkId] &&
+    ["awaiting_payment", "transfer_reported", "paid"].includes(session.status)
+    ? session.status : "open",
+};
+const hasValidSessionToken = (session, token) => Boolean(token) &&
+  Array.isArray(session.accessTokens) && session.accessTokens.some(
+    (entry) => entry.hash === hashSessionAccessToken(token) && Number(entry.expiresAt) > Date.now(),
+  );
+const hasCheckAccess = (session, checkId, secret) =>
+  !session.checks?.[checkId]?.secretHash ||
+  (validCheckSecret(secret) && hashCheckSecret(secret) === session.checks[checkId].secretHash);
+
 const createSessionAccessToken = () => crypto.randomBytes(32).toString("hex");
 const hashSessionAccessToken = (token) =>
   crypto.createHash("sha256").update(String(token || "")).digest("hex");
@@ -157,6 +185,11 @@ const createOtp = () => String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
 const DEFAULT_MONTHLY_FEES = {
   restaurant: 25000,
   lounge: 40000,
+};
+
+const SUBSCRIPTION_PRICING = {
+  restaurant: { monthly: 25000, yearly: 250000 },
+  lounge: { monthly: 40000, yearly: 400000 },
 };
 
 // A venue is operational only after a platform administrator activates it.
@@ -245,6 +278,20 @@ const userCanOperate = (uid, restaurantId) =>
 // Management only (mirrors canManageRestaurant) — owner/manager/admin.
 const userCanManage = (uid, restaurantId) =>
   hasRestaurantAccess(uid, restaurantId, MANAGE_ROLES);
+
+// Billing must remain available while a workspace is awaiting its first
+// payment or recovering from a failed renewal. It therefore checks ownership
+// and role without requiring the workspace itself to be active.
+const userCanManageSubscription = async (uid, restaurantId) => {
+  if (await isSuperAdmin(uid)) return true;
+  const profileSnap = await db.doc(`restaurants/${restaurantId}/profile/info`).get();
+  if (!profileSnap.exists) return false;
+  if (profileSnap.data().ownerUid === uid) return true;
+  const userSnap = await db.doc(`users/${uid}`).get();
+  if (!userSnap.exists) return false;
+  const user = userSnap.data();
+  return user.restaurantId === restaurantId && MANAGE_ROLES.includes(user.role);
+};
 
 const cloudinaryPublicIdFromUrl = (value) => {
   try {
@@ -368,13 +415,58 @@ const verifyPaystackReference = async (reference) => {
   return data.data;
 };
 
-const getSubscriptionPlanCode = (profile) => {
-  const operation = profile.businessType === "lounge" ? "LOUNGE" : "RESTAURANT";
-  const cycle = profile.billingCycle === "yearly" ? "YEARLY" : "MONTHLY";
+const normalizeSubscriptionType = (value) => value === "lounge" ? "lounge" : "restaurant";
+const normalizeSubscriptionCycle = (value) => value === "yearly" ? "yearly" : "monthly";
+
+const getSubscriptionPlanCode = (businessType, billingCycle) => {
+  const operation = normalizeSubscriptionType(businessType) === "lounge" ? "LOUNGE" : "RESTAURANT";
+  const cycle = normalizeSubscriptionCycle(billingCycle) === "yearly" ? "YEARLY" : "MONTHLY";
   return process.env[`PAYSTACK_${operation}_${cycle}_PLAN_CODE`] || "";
 };
 
-const subscriptionDays = (cycle) => (cycle === "yearly" ? 365 : 30);
+const getSubscriptionConfig = (businessType, billingCycle) => {
+  const type = normalizeSubscriptionType(businessType);
+  const cycle = normalizeSubscriptionCycle(billingCycle);
+  return {
+    businessType: type,
+    billingCycle: cycle,
+    planCode: getSubscriptionPlanCode(type, cycle),
+    amountNaira: SUBSCRIPTION_PRICING[type][cycle],
+  };
+};
+
+const planCodeFromPayload = (data) =>
+  data?.plan?.plan_code ||
+  data?.plan_object?.plan_code ||
+  data?.subscription?.plan?.plan_code ||
+  data?.metadata?.planCode ||
+  "";
+
+const subscriptionCodeFromPayload = (data) =>
+  data?.subscription_code || data?.subscription?.subscription_code || "";
+
+const customerCodeFromPayload = (data) =>
+  data?.customer?.customer_code || data?.customer_code || "";
+
+const subscriptionIntentId = (email, planCode) =>
+  hashValue(`${normalizeEmail(email)}|${String(planCode || "")}`);
+
+const customerPlanId = (customerCode, planCode) =>
+  hashValue(`${String(customerCode || "")}|${String(planCode || "")}`);
+
+const addSubscriptionPeriod = (value, cycle) => {
+  const next = new Date(value);
+  if (normalizeSubscriptionCycle(cycle) === "yearly") {
+    next.setUTCFullYear(next.getUTCFullYear() + 1);
+  } else {
+    // Paystack renews subscriptions opened on the 29th–31st on the 28th.
+    const originalDay = next.getUTCDate();
+    next.setUTCDate(1);
+    next.setUTCMonth(next.getUTCMonth() + 1);
+    next.setUTCDate(Math.min(originalDay, 28));
+  }
+  return next;
+};
 
 // Generate a Firebase email-verification link. Tries to send the user back to the
 // app's /login afterwards; falls back to the default handler if that domain isn't
@@ -1140,9 +1232,10 @@ app.post("/create-subaccount", rateLimit({ windowMs: 60_000, max: 10 }), require
 // subscription. The attached Paystack plan creates subsequent automatic renewals.
 app.post("/subscription-checkout", requireFirebaseUser, async (req, res) => {
   const restaurantId = String(req.body?.restaurantId || "").trim();
+  const requestedCycle = normalizeSubscriptionCycle(req.body?.billingCycle);
   if (!restaurantId) return res.status(400).json({ error: "restaurantId is required." });
   try {
-    if (!(await userCanManage(req.firebaseUser.uid, restaurantId))) {
+    if (!(await userCanManageSubscription(req.firebaseUser.uid, restaurantId))) {
       return res.status(403).json({ error: "Not authorized for this restaurant." });
     }
     const profileRef = db.doc(`restaurants/${restaurantId}/profile/info`);
@@ -1152,10 +1245,28 @@ app.post("/subscription-checkout", requireFirebaseUser, async (req, res) => {
     if (profile.planKind === "custom") {
       return res.status(409).json({ error: "Your Custom plan is activated by the Servrr team. Please contact support." });
     }
-    const planCode = getSubscriptionPlanCode(profile);
-    if (!planCode) {
+    if (profile.paystackSubscriptionCode && ["active", "non_renewing"].includes(profile.subscriptionStatus)) {
+      return res.status(409).json({ error: "Automatic billing is already active. Use Manage billing to update or cancel it." });
+    }
+    if (profile.pendingSubscriptionReference && profile.pendingSubscriptionCycle === requestedCycle) {
+      const pendingSnap = await db.doc(`subscriptionCheckouts/${profile.pendingSubscriptionReference}`).get();
+      const pending = pendingSnap.data();
+      if (pendingSnap.exists && pending?.status === "initialized" && pending?.authorizationUrl) {
+        return res.json({
+          authorizationUrl: pending.authorizationUrl,
+          reference: profile.pendingSubscriptionReference,
+        });
+      }
+    }
+    const config = getSubscriptionConfig(profile.businessType, requestedCycle);
+    if (!config.planCode) {
       return res.status(503).json({ error: "Subscription billing is not configured yet. Please contact support." });
     }
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+      return res.status(503).json({ error: "Subscription billing is not configured yet. Please contact support." });
+    }
+    const billingEmail = normalizeEmail(req.firebaseUser.email || profile.email);
+    if (!billingEmail) return res.status(400).json({ error: "A billing email is required." });
     const response = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
       headers: {
@@ -1163,20 +1274,86 @@ app.post("/subscription-checkout", requireFirebaseUser, async (req, res) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        email: req.firebaseUser.email || profile.email,
-        plan: planCode,
+        email: billingEmail,
+        amount: config.amountNaira * 100,
+        plan: config.planCode,
         callback_url: `${APP_URL}/${encodeURIComponent(restaurantId)}/admin?subscription=complete`,
-        metadata: { restaurantId, purpose: "servrr_subscription" },
+        metadata: {
+          restaurantId,
+          purpose: "servrr_subscription",
+          businessType: config.businessType,
+          billingCycle: config.billingCycle,
+          planCode: config.planCode,
+        },
       }),
     });
     const payload = await response.json();
-    if (!response.ok || !payload.status || !payload.data?.authorization_url) {
+    const checkoutReference = payload.data?.reference;
+    if (!response.ok || !payload.status || !payload.data?.authorization_url || !checkoutReference) {
       return res.status(502).json({ error: payload.message || "Could not start subscription checkout." });
     }
-    return res.json({ authorizationUrl: payload.data.authorization_url });
+    const checkout = {
+      reference: checkoutReference,
+      restaurantId,
+      billingEmail,
+      businessType: config.businessType,
+      billingCycle: config.billingCycle,
+      planCode: config.planCode,
+      amountNaira: config.amountNaira,
+      amountKobo: config.amountNaira * 100,
+      authorizationUrl: payload.data.authorization_url,
+      accessCode: payload.data.access_code || null,
+      status: "initialized",
+      createdAt: FieldValue.serverTimestamp(),
+    };
+    const batch = db.batch();
+    batch.set(db.doc(`subscriptionCheckouts/${checkoutReference}`), checkout);
+    batch.set(
+      db.doc(`subscriptionIntents/${subscriptionIntentId(billingEmail, config.planCode)}`),
+      checkout,
+      { merge: true },
+    );
+    batch.set(profileRef, {
+      pendingSubscriptionReference: checkoutReference,
+      pendingSubscriptionCycle: config.billingCycle,
+      pendingSubscriptionPlanCode: config.planCode,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+    await batch.commit();
+    return res.json({
+      authorizationUrl: payload.data.authorization_url,
+      reference: checkoutReference,
+    });
   } catch (err) {
     console.error("Subscription checkout error:", err);
     return res.status(500).json({ error: "Could not start subscription checkout." });
+  }
+});
+
+app.post("/subscription-manage-link", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  if (!restaurantId) return res.status(400).json({ error: "restaurantId is required." });
+  try {
+    if (!(await userCanManageSubscription(req.firebaseUser.uid, restaurantId))) {
+      return res.status(403).json({ error: "Not authorized for this restaurant." });
+    }
+    const profileSnap = await db.doc(`restaurants/${restaurantId}/profile/info`).get();
+    const subscriptionCode = profileSnap.data()?.paystackSubscriptionCode;
+    if (!subscriptionCode) {
+      return res.status(404).json({ error: "No automatic subscription is connected yet." });
+    }
+    const response = await fetch(
+      `https://api.paystack.co/subscription/${encodeURIComponent(subscriptionCode)}/manage/link`,
+      { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } },
+    );
+    const payload = await response.json();
+    if (!response.ok || !payload.status || !payload.data?.link) {
+      return res.status(502).json({ error: payload.message || "Could not open subscription management." });
+    }
+    return res.json({ url: payload.data.link });
+  } catch (err) {
+    console.error("Subscription management link error:", err);
+    return res.status(500).json({ error: "Could not open subscription management." });
   }
 });
 
@@ -1207,72 +1384,245 @@ app.post("/verify-payment", async (req, res) => {
   }
 });
 
-app.post("/paystack-webhook", async (req, res) => {
-  const signature = req.headers["x-paystack-signature"];
-  const hash = crypto
-    .createHmac("sha512", process.env.PAYSTACK_SECRET_KEY)
-    .update(JSON.stringify(req.body))
-    .digest("hex");
+const resolveSubscriptionContext = async (data, reference) => {
+  const planCode = planCodeFromPayload(data);
+  const subscriptionCode = subscriptionCodeFromPayload(data);
+  const customerCode = customerCodeFromPayload(data);
 
-  if (!signature || hash !== signature) {
-    return res.status(401).send("Invalid signature");
+  if (reference) {
+    const checkoutSnap = await db.doc(`subscriptionCheckouts/${reference}`).get();
+    if (checkoutSnap.exists) return { ...checkoutSnap.data(), subscriptionCode, customerCode };
+  }
+  if (subscriptionCode) {
+    const subscriptionSnap = await db.doc(`paystackSubscriptions/${subscriptionCode}`).get();
+    if (subscriptionSnap.exists) return { ...subscriptionSnap.data(), subscriptionCode, customerCode, planCode: planCode || subscriptionSnap.data().planCode };
+  }
+  if (customerCode && planCode) {
+    const customerPlanSnap = await db.doc(`paystackCustomerPlans/${customerPlanId(customerCode, planCode)}`).get();
+    if (customerPlanSnap.exists) return { ...customerPlanSnap.data(), subscriptionCode, customerCode, planCode };
+  }
+  const customerEmail = normalizeEmail(data?.customer?.email);
+  if (customerEmail && planCode) {
+    const intentSnap = await db.doc(`subscriptionIntents/${subscriptionIntentId(customerEmail, planCode)}`).get();
+    if (intentSnap.exists) return { ...intentSnap.data(), subscriptionCode, customerCode, planCode };
+  }
+  return null;
+};
+
+const recordSuccessfulSubscriptionPayment = async (data, eventName) => {
+  const transaction = data?.transaction && typeof data.transaction === "object"
+    ? data.transaction
+    : data;
+  const reference = String(transaction?.reference || data?.reference || "").trim();
+  if (!reference) return false;
+
+  const context = await resolveSubscriptionContext(data, reference) ||
+    await resolveSubscriptionContext(transaction, reference);
+  if (!context?.restaurantId) return false;
+
+  const config = getSubscriptionConfig(context.businessType, context.billingCycle);
+  const receivedPlanCode = planCodeFromPayload(data) || planCodeFromPayload(transaction) || context.planCode;
+  const amountKobo = Number(transaction?.amount ?? data?.amount);
+  const currency = String(transaction?.currency || data?.currency || "NGN").toUpperCase();
+  if (!config.planCode || receivedPlanCode !== config.planCode) {
+    throw new Error(`Subscription plan mismatch for ${context.restaurantId}.`);
+  }
+  if (currency !== "NGN" || amountKobo !== config.amountNaira * 100) {
+    throw new Error(`Subscription amount mismatch for ${context.restaurantId}.`);
   }
 
-  const event = req.body;
-  const transaction = event?.data || {};
-  const reference = transaction.reference;
+  const profileRef = db.doc(`restaurants/${context.restaurantId}/profile/info`);
+  const processedRef = db.doc(`subscriptionPayments/${hashValue(reference)}`);
+  const billingRef = db.doc(`restaurants/${context.restaurantId}/billing/${hashValue(reference)}`);
+  const subscriptionCode = subscriptionCodeFromPayload(data) || context.subscriptionCode || "";
+  const customerCode = customerCodeFromPayload(data) || customerCodeFromPayload(transaction) || context.customerCode || "";
+  const nextPaymentValue = data?.subscription?.next_payment_date || data?.next_payment_date;
 
-  if (!reference) return res.sendStatus(200);
+  await db.runTransaction(async (tx) => {
+    const [processedSnap, profileSnap] = await Promise.all([
+      tx.get(processedRef),
+      tx.get(profileRef),
+    ]);
+    if (processedSnap.exists) return;
+    if (!profileSnap.exists) throw new Error(`Workspace ${context.restaurantId} not found.`);
+
+    const profile = profileSnap.data();
+    const now = new Date();
+    const currentUntil = profile.subscriptionPaidUntil?.toDate?.() || null;
+    const base = currentUntil && currentUntil > now ? currentUntil : now;
+    const eventNextPayment = nextPaymentValue ? new Date(nextPaymentValue) : null;
+    const paidUntil = eventNextPayment && Number.isFinite(eventNextPayment.getTime()) && eventNextPayment > now
+      ? eventNextPayment
+      : addSubscriptionPeriod(base, config.billingCycle);
+    const clearsBillingSuspension = !profile.suspended || [
+      "payment_pending",
+      "subscription_failed",
+      "subscription_lapsed",
+    ].includes(profile.suspendedReason);
+
+    tx.set(profileRef, {
+      businessType: config.businessType,
+      billingCycle: config.billingCycle,
+      monthlyFee: SUBSCRIPTION_PRICING[config.businessType].monthly,
+      billingAmountPaid: config.amountNaira,
+      subscriptionStatus: "active",
+      subscriptionPaidUntil: paidUntil,
+      subscriptionAutoRenew: true,
+      subscriptionPlanCode: config.planCode,
+      paystackSubscriptionCode: subscriptionCode || profile.paystackSubscriptionCode || null,
+      paystackCustomerCode: customerCode || profile.paystackCustomerCode || null,
+      lastSubscriptionPaymentAt: FieldValue.serverTimestamp(),
+      lastSubscriptionReference: reference,
+      pendingSubscriptionReference: FieldValue.delete(),
+      pendingSubscriptionCycle: FieldValue.delete(),
+      pendingSubscriptionPlanCode: FieldValue.delete(),
+      ...(clearsBillingSuspension ? { suspended: false, suspendedReason: null } : {}),
+    }, { merge: true });
+    tx.set(billingRef, {
+      date: FieldValue.serverTimestamp(),
+      type: config.businessType,
+      planKind: profile.planKind || "standard",
+      cycle: config.billingCycle,
+      amount: config.amountNaira,
+      status: "paid",
+      reference,
+      source: "paystack_subscription",
+      event: eventName,
+    });
+    tx.set(processedRef, {
+      reference,
+      restaurantId: context.restaurantId,
+      planCode: config.planCode,
+      amountKobo,
+      event: eventName,
+      processedAt: FieldValue.serverTimestamp(),
+    });
+    if (subscriptionCode) {
+      tx.set(db.doc(`paystackSubscriptions/${subscriptionCode}`), {
+        restaurantId: context.restaurantId,
+        businessType: config.businessType,
+        billingCycle: config.billingCycle,
+        planCode: config.planCode,
+        customerCode: customerCode || null,
+        subscriptionCode,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    }
+    if (customerCode) {
+      tx.set(db.doc(`paystackCustomerPlans/${customerPlanId(customerCode, config.planCode)}`), {
+        restaurantId: context.restaurantId,
+        businessType: config.businessType,
+        billingCycle: config.billingCycle,
+        planCode: config.planCode,
+        customerCode,
+        subscriptionCode: subscriptionCode || null,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    }
+  });
+
+  await db.doc(`subscriptionCheckouts/${reference}`).set({
+    status: "paid",
+    paidAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+  return true;
+};
+
+app.post("/paystack-webhook", async (req, res) => {
+  const signature = String(req.headers["x-paystack-signature"] || "");
+  const secret = process.env.PAYSTACK_SECRET_KEY || "";
+  const hash = crypto.createHmac("sha512", secret).update(req.rawBody || Buffer.from("")).digest("hex");
+  const signatureMatches = signature.length === hash.length &&
+    crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(hash));
+  if (!secret || !signatureMatches) return res.status(401).send("Invalid signature");
+
+  const event = req.body || {};
+  const data = event.data || {};
+  const eventName = String(event.event || "");
+  const transaction = data?.transaction && typeof data.transaction === "object" ? data.transaction : data;
+  const reference = String(transaction?.reference || data?.reference || "").trim();
 
   try {
-    const metadata = transaction.metadata || {};
-    // The first successful charge activates the venue and Paystack keeps the
-    // subscription authorization for later monthly/annual renewals.
-    if (metadata.purpose === "servrr_subscription" && metadata.restaurantId && event.event === "charge.success") {
-      const profileRef = db.doc(`restaurants/${metadata.restaurantId}/profile/info`);
-      const profileSnap = await profileRef.get();
-      if (profileSnap.exists) {
-        const profile = profileSnap.data();
-        const now = new Date();
-        const currentUntil = profile.subscriptionPaidUntil?.toDate?.() || null;
-        const base = currentUntil && currentUntil > now ? currentUntil : now;
-        const paidUntil = new Date(base);
-        paidUntil.setDate(paidUntil.getDate() + subscriptionDays(profile.billingCycle));
-        await profileRef.update({
+    if (eventName === "charge.success") {
+      await recordSuccessfulSubscriptionPayment(data, eventName);
+    }
+
+    if (eventName === "invoice.update" && data.paid === true && data.status === "success") {
+      await recordSuccessfulSubscriptionPayment(data, eventName);
+    }
+
+    if (eventName === "subscription.create") {
+      const context = await resolveSubscriptionContext(data, reference);
+      const subscriptionCode = subscriptionCodeFromPayload(data);
+      const planCode = planCodeFromPayload(data) || context?.planCode;
+      const customerCode = customerCodeFromPayload(data) || context?.customerCode;
+      if (context?.restaurantId && subscriptionCode && planCode) {
+        const businessType = normalizeSubscriptionType(context.businessType);
+        const billingCycle = normalizeSubscriptionCycle(context.billingCycle);
+        const batch = db.batch();
+        batch.set(db.doc(`paystackSubscriptions/${subscriptionCode}`), {
+          restaurantId: context.restaurantId,
+          businessType,
+          billingCycle,
+          subscriptionCode,
+          planCode,
+          customerCode: customerCode || null,
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+        batch.set(db.doc(`restaurants/${context.restaurantId}/profile/info`), {
+          paystackSubscriptionCode: subscriptionCode,
+          paystackCustomerCode: customerCode || null,
+          subscriptionPlanCode: planCode,
+          subscriptionAutoRenew: true,
           subscriptionStatus: "active",
-          subscriptionPaidUntil: paidUntil,
-          suspended: false,
-          suspendedReason: null,
-          lastSubscriptionPaymentAt: FieldValue.serverTimestamp(),
-        });
-        await db.collection(`restaurants/${metadata.restaurantId}/billing`).add({
-          date: FieldValue.serverTimestamp(),
-          type: profile.businessType || "restaurant",
-          planKind: profile.planKind || "standard",
-          cycle: profile.billingCycle || "monthly",
-          amount: Number(transaction.amount || 0) / 100,
-          status: "paid",
-          reference: transaction.reference || null,
-          source: "paystack_subscription",
-        });
+          subscriptionNextPaymentAt: data.next_payment_date ? new Date(data.next_payment_date) : null,
+        }, { merge: true });
+        if (customerCode) {
+          batch.set(db.doc(`paystackCustomerPlans/${customerPlanId(customerCode, planCode)}`), {
+            restaurantId: context.restaurantId,
+            businessType,
+            billingCycle,
+            subscriptionCode,
+            planCode,
+            customerCode,
+            updatedAt: FieldValue.serverTimestamp(),
+          }, { merge: true });
+        }
+        await batch.commit();
       }
     }
-    await db.doc(`paymentReferences/${reference}`).set(
-      {
+
+    if (["subscription.not_renew", "subscription.disable", "invoice.payment_failed"].includes(eventName)) {
+      const context = await resolveSubscriptionContext(data, reference);
+      if (context?.restaurantId) {
+        const status = eventName === "invoice.payment_failed"
+          ? "past_due"
+          : eventName === "subscription.not_renew" ? "non_renewing" : "cancelled";
+        await db.doc(`restaurants/${context.restaurantId}/profile/info`).set({
+          subscriptionStatus: status,
+          subscriptionAutoRenew: eventName === "invoice.payment_failed",
+          subscriptionPaymentFailedAt: eventName === "invoice.payment_failed" ? FieldValue.serverTimestamp() : null,
+          subscriptionUpdatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+    }
+
+    if (reference) {
+      const metadata = transaction.metadata || data.metadata || {};
+      await db.doc(`paymentReferences/${reference}`).set({
         reference,
-        event: event.event || null,
-        status: transaction.status || null,
-        amount: Number(transaction.amount || 0),
-        currency: transaction.currency || null,
+        event: eventName || null,
+        status: transaction.status || data.status || null,
+        amount: Number(transaction.amount ?? data.amount ?? 0),
+        currency: transaction.currency || data.currency || null,
         restaurantId: metadata.restaurantId || null,
         table: metadata.table || null,
         customerName: metadata.customerName || null,
         paidAt: transaction.paid_at ? new Date(transaction.paid_at) : null,
-        raw: transaction,
+        raw: data,
         webhookReceivedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
+      }, { merge: true });
+    }
   } catch (err) {
     console.error("Paystack webhook persistence error:", err);
     return res.sendStatus(500);
@@ -1490,6 +1840,7 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
         closedAt: null,
         totalBill: 0,
         orderIds: [],
+        checks: {},
         accessTokens: [{ hash: accessTokenHash, expiresAt: accessTokenExpiresAt }],
         paymentMode,
         paidVia: null,
@@ -1524,8 +1875,11 @@ app.post("/place-order", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
   const table = String(req.body?.table || "").trim();
   const allergies = String(req.body?.allergies || "").trim().slice(0, 500);
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  const requestedCheckId = String(req.body?.checkId || "");
+  const checkSecret = String(req.body?.checkSecret || "");
 
-  if (!restaurantId || !sessionId || !accessToken || !customerName || !table) {
+  if (!restaurantId || !sessionId || !accessToken || !customerName || !table ||
+      !validCheckId(requestedCheckId) || !validCheckSecret(checkSecret)) {
     return res.status(400).json({ error: "A valid table session, name, and table are required." });
   }
   if (!validateOrderItems(items)) {
@@ -1549,6 +1903,12 @@ app.post("/place-order", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
       }
       if (session.status !== "open") {
         throw Object.assign(new Error("This table is no longer accepting orders."), { statusCode: 409 });
+      }
+      if (checkState(session, requestedCheckId).status !== "open") {
+        throw Object.assign(new Error("This check has requested payment. Ask staff to reopen it or start a new visit."), { statusCode: 409 });
+      }
+      if (!hasCheckAccess(session, requestedCheckId, checkSecret)) {
+        throw Object.assign(new Error("This check belongs to another guest."), { statusCode: 403 });
       }
 
       const menuSnap = await tx.get(db.collection(`restaurants/${restaurantId}/menu`));
@@ -1578,10 +1938,12 @@ app.post("/place-order", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
         status: "pending",
         createdAt: FieldValue.serverTimestamp(),
         sessionId,
+        checkId: requestedCheckId,
       });
       tx.update(sessionRef, {
         orderIds: FieldValue.arrayUnion(orderRef.id),
         totalBill: FieldValue.increment(total),
+        checks: { ...(session.checks || {}), [requestedCheckId]: { status: "open", secretHash: hashCheckSecret(checkSecret) } },
         updatedAt: FieldValue.serverTimestamp(),
       });
       return { orderId: orderRef.id };
@@ -1652,6 +2014,7 @@ app.post(
 
         let sessionRef = null;
         let createdSession = false;
+        let existingSession = null;
         const currentSessionId = tableSnap.exists
           ? tableSnap.data().currentSessionId || null
           : null;
@@ -1664,6 +2027,7 @@ app.post(
             const current = currentSnap.data();
             if (current.status === "open") {
               sessionRef = currentRef;
+              existingSession = current;
             } else if (["awaiting_payment", "transfer_reported"].includes(current.status)) {
               throw Object.assign(
                 new Error(`Table ${table} has an unsettled bill. Close it before starting another order.`),
@@ -1722,6 +2086,7 @@ app.post(
 
         const total = calculateItemsTotal(verifiedItems);
         const orderRef = db.collection(`restaurants/${restaurantId}/orders`).doc();
+        const staffCheckId = `c_${crypto.randomBytes(16).toString("hex")}`;
         const auditRef = db.doc(
           `restaurants/${restaurantId}/orderAudit/${orderRef.id}`,
         );
@@ -1735,6 +2100,7 @@ app.post(
           status: "pending",
           createdAt: FieldValue.serverTimestamp(),
           sessionId: sessionRef.id,
+          checkId: staffCheckId,
           orderSource: "staff",
           createdByName: actorName,
         });
@@ -1764,6 +2130,7 @@ app.post(
             closedAt: null,
             totalBill: total,
             orderIds: [orderRef.id],
+            checks: { [staffCheckId]: { status: "open" } },
             accessTokens: [],
             paymentMode: normalizePaymentMode(profileSnap.data()?.paymentMode),
             paidVia: null,
@@ -1774,6 +2141,7 @@ app.post(
           tx.update(sessionRef, {
             orderIds: FieldValue.arrayUnion(orderRef.id),
             totalBill: FieldValue.increment(total),
+            checks: { ...(existingSession.checks || {}), [staffCheckId]: { status: "open" } },
             updatedAt: FieldValue.serverTimestamp(),
           });
         }
@@ -1797,6 +2165,7 @@ app.post("/edit-order", rateLimit({ windowMs: 60_000, max: 20 }), async (req, re
   const orderId = String(req.body?.orderId || "").trim();
   const sessionId = String(req.body?.sessionId || "").trim();
   const accessToken = String(req.body?.accessToken || "").trim();
+  const checkSecret = String(req.body?.checkSecret || "");
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
   if (!restaurantId || !orderId || !sessionId || !accessToken || !validateOrderItems(items)) {
     return res.status(400).json({ error: "Invalid order update." });
@@ -1819,7 +2188,11 @@ app.post("/edit-order", rateLimit({ windowMs: 60_000, max: 20 }), async (req, re
         throw Object.assign(new Error("This order can no longer be edited."), { statusCode: 409 });
       }
       const order = orderSnap.data();
-      if (order.sessionId !== sessionId || order.status !== "pending" || order.paymentStatus === "paid") {
+      if (!hasCheckAccess(session, orderCheckId(order), checkSecret)) {
+        throw Object.assign(new Error("This check belongs to another guest."), { statusCode: 403 });
+      }
+      if (order.sessionId !== sessionId || order.status !== "pending" || order.paymentStatus === "paid" ||
+          checkState(session, orderCheckId(order)).status !== "open") {
         throw Object.assign(new Error("This order can no longer be edited."), { statusCode: 409 });
       }
       const menuByName = new Map(menuSnap.docs.map((doc) => [String(doc.data().name || "").trim(), doc.data()]));
@@ -1851,6 +2224,7 @@ app.post("/cancel-order", rateLimit({ windowMs: 60_000, max: 10 }), async (req, 
   const orderId = String(req.body?.orderId || "").trim();
   const sessionId = String(req.body?.sessionId || "").trim();
   const accessToken = String(req.body?.accessToken || "").trim();
+  const checkSecret = String(req.body?.checkSecret || "");
   if (!restaurantId || !orderId || !sessionId || !accessToken) {
     return res.status(400).json({ error: "Invalid cancellation request." });
   }
@@ -1868,7 +2242,11 @@ app.post("/cancel-order", rateLimit({ windowMs: 60_000, max: 10 }), async (req, 
         throw Object.assign(new Error("This order can no longer be cancelled."), { statusCode: 409 });
       }
       const order = orderSnap.data();
-      if (order.sessionId !== sessionId || order.status !== "pending" || order.paymentStatus === "paid") {
+      if (!hasCheckAccess(session, orderCheckId(order), checkSecret)) {
+        throw Object.assign(new Error("This check belongs to another guest."), { statusCode: 403 });
+      }
+      if (order.sessionId !== sessionId || order.status !== "pending" || order.paymentStatus === "paid" ||
+          checkState(session, orderCheckId(order)).status !== "open") {
         throw Object.assign(new Error("This order can no longer be cancelled."), { statusCode: 409 });
       }
       tx.update(orderRef, { status: "cancelled", updatedAt: FieldValue.serverTimestamp() });
@@ -1884,38 +2262,207 @@ app.post("/cancel-order", rateLimit({ windowMs: 60_000, max: 10 }), async (req, 
   }
 });
 
+// A diner may briefly expose their bill to other authenticated guests at the
+// same table. Only a short label and the outstanding total are returned.
+app.post("/group-payment-sharing", rateLimit({ windowMs: 60_000, max: 20 }), async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const sessionId = String(req.body?.sessionId || "").trim();
+  const orderId = String(req.body?.orderId || "").trim();
+  const accessToken = String(req.body?.accessToken || "").trim();
+  const checkSecret = String(req.body?.checkSecret || "");
+  const enabled = req.body?.enabled === true;
+  if (!restaurantId || !sessionId || !orderId || !accessToken) {
+    return res.status(400).json({ error: "A valid order and table session are required." });
+  }
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
+      const orderRef = db.doc(`restaurants/${restaurantId}/orders/${orderId}`);
+      const [sessionSnap, orderSnap] = await Promise.all([tx.get(sessionRef), tx.get(orderRef)]);
+      const session = sessionSnap.data();
+      const order = orderSnap.data();
+      if (!session || !order || order.sessionId !== sessionId ||
+          !hasValidSessionToken(session, accessToken)) {
+        throw Object.assign(new Error("Order access has expired."), { statusCode: 403 });
+      }
+      if (session.status !== "open") {
+        throw Object.assign(new Error("This table can no longer share bills."), { statusCode: 409 });
+      }
+      const checkId = orderCheckId(order);
+      if (!validCheckId(checkId) || !hasCheckAccess(session, checkId, checkSecret)) {
+        throw Object.assign(new Error("This bill cannot be shared."), { statusCode: 403 });
+      }
+      const currentCheck = checkState(session, checkId);
+      if (currentCheck.status !== "open" || order.status === "cancelled" || order.paymentStatus === "paid") {
+        throw Object.assign(new Error("Only an open unpaid bill can be shared."), { statusCode: 409 });
+      }
+      const shareUntil = enabled ? new Date(Date.now() + GROUP_PAYMENT_SHARE_MS) : null;
+      tx.update(sessionRef, {
+        checks: {
+          ...(session.checks || {}),
+          [checkId]: {
+            ...currentCheck,
+            groupPaymentShareUntil: shareUntil,
+            groupPaymentShareLabel: enabled
+              ? String(order.customerName || "Guest").trim().split(/\s+/)[0].slice(0, 40)
+              : null,
+          },
+        },
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return { enabled, shareUntil: shareUntil?.toISOString() || null };
+    });
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("Group payment sharing error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not update bill sharing." });
+  }
+});
+
+app.get("/shared-table-bills", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
+  const restaurantId = String(req.query.restaurantId || "").trim();
+  const sessionId = String(req.query.sessionId || "").trim();
+  const orderId = String(req.query.orderId || "").trim();
+  const accessToken = String(req.query.accessToken || "").trim();
+  const checkSecret = String(req.query.checkSecret || "");
+  if (!restaurantId || !sessionId || !orderId || !accessToken) {
+    return res.status(400).json({ error: "A valid order and table session are required." });
+  }
+
+  try {
+    const [sessionSnap, orderSnap] = await Promise.all([
+      db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`).get(),
+      db.doc(`restaurants/${restaurantId}/orders/${orderId}`).get(),
+    ]);
+    const session = sessionSnap.data();
+    const order = orderSnap.data();
+    if (!session || !order || order.sessionId !== sessionId ||
+        !hasValidSessionToken(session, accessToken)) {
+      return res.status(403).json({ error: "Order access has expired." });
+    }
+    if (session.status !== "open") {
+      return res.status(409).json({ error: "This table can no longer start a combined payment." });
+    }
+    const ownCheckId = orderCheckId(order);
+    if (!hasCheckAccess(session, ownCheckId, checkSecret)) {
+      return res.status(403).json({ error: "This bill belongs to another guest." });
+    }
+    const orderSnaps = await Promise.all((session.orderIds || []).map((id) =>
+      db.doc(`restaurants/${restaurantId}/orders/${id}`).get(),
+    ));
+    const groups = new Map();
+    orderSnaps.forEach((snap) => {
+      if (!snap.exists) return;
+      const item = snap.data();
+      const checkId = orderCheckId(item);
+      const state = checkState(session, checkId);
+      if (checkId === ownCheckId || !validCheckId(checkId) || state.status !== "open" ||
+          toMillis(state.groupPaymentShareUntil) <= Date.now() ||
+          item.status === "cancelled" || item.paymentStatus === "paid") return;
+      if (!groups.has(checkId)) {
+        groups.set(checkId, {
+          checkId,
+          label: state.groupPaymentShareLabel || "Guest",
+          total: 0,
+          orderCount: 0,
+          shareUntil: new Date(toMillis(state.groupPaymentShareUntil)).toISOString(),
+        });
+      }
+      const group = groups.get(checkId);
+      group.total += Number(item.total || 0);
+      group.orderCount += 1;
+    });
+    return res.json({ bills: [...groups.values()] });
+  } catch (err) {
+    console.error("Shared table bills error:", err);
+    return res.status(500).json({ error: "Could not load shared bills." });
+  }
+});
+
 // POST /request-bill — customer-triggered soft lock, idempotent (public)
 app.post("/request-bill", async (req, res) => {
   const restaurantId = String(req.body?.restaurantId || "").trim();
   const sessionId = String(req.body?.sessionId || "").trim();
-  if (!restaurantId || !sessionId) {
-    return res.status(400).json({ error: "restaurantId and sessionId are required" });
+  const orderId = String(req.body?.orderId || "").trim();
+  const accessToken = String(req.body?.accessToken || "").trim();
+  const checkSecret = String(req.body?.checkSecret || "");
+  const includedCheckIds = [...new Set(
+    Array.isArray(req.body?.includedCheckIds) ? req.body.includedCheckIds.map(String) : [],
+  )];
+  if (!restaurantId || !sessionId || !orderId || !accessToken ||
+      includedCheckIds.some((id) => !validCheckId(id))) {
+    return res.status(400).json({ error: "A valid order and table session are required." });
   }
 
   try {
-    const status = await db.runTransaction(async (tx) => {
+    const result = await db.runTransaction(async (tx) => {
       const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
-      const sessionSnap = await tx.get(sessionRef);
-      if (!sessionSnap.exists) {
-        throw Object.assign(new Error("Table session not found."), { statusCode: 404 });
+      const orderRef = db.doc(`restaurants/${restaurantId}/orders/${orderId}`);
+      const [sessionSnap, orderSnap] = await Promise.all([tx.get(sessionRef), tx.get(orderRef)]);
+      if (!sessionSnap.exists || !orderSnap.exists || orderSnap.data().sessionId !== sessionId ||
+          !hasValidSessionToken(sessionSnap.data(), accessToken)) {
+        throw Object.assign(new Error("Order access has expired. Please ask a waiter for the bill."), { statusCode: 403 });
       }
-
       const session = sessionSnap.data();
-      if (session.status !== "open") {
-        return session.status;
+      const checkId = orderCheckId(orderSnap.data());
+      if (!hasCheckAccess(session, checkId, checkSecret)) {
+        throw Object.assign(new Error("This check belongs to another guest."), { statusCode: 403 });
       }
-
-      tx.update(sessionRef, {
-        status: "awaiting_payment",
-        billRequestedAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-        transferReportedAt: null,
-        transferReference: null,
+      if (orderSnap.data().status === "cancelled" || orderSnap.data().paymentStatus === "paid") {
+        throw Object.assign(new Error("This order has no outstanding bill."), { statusCode: 409 });
+      }
+      const currentCheck = checkState(session, checkId);
+      if (currentCheck.status === "paid") return { status: "paid", checkId };
+      if (currentCheck.status !== "open") return { status: currentCheck.status, checkId };
+      if (session.status !== "open") {
+        throw Object.assign(new Error("This table can no longer request a bill."), { statusCode: 409 });
+      }
+      const targetCheckIds = [...new Set([checkId, ...includedCheckIds.filter((id) => id !== checkId)])];
+      const orderSnaps = await Promise.all((session.orderIds || []).map((id) =>
+        tx.get(db.doc(`restaurants/${restaurantId}/orders/${id}`)),
+      ));
+      const targetOrders = orderSnaps.filter((snap) => snap.exists &&
+        targetCheckIds.includes(orderCheckId(snap.data())) &&
+        snap.data().status !== "cancelled" && snap.data().paymentStatus !== "paid");
+      if (targetCheckIds.some((id) => !targetOrders.some((snap) => orderCheckId(snap.data()) === id))) {
+        throw Object.assign(new Error("One of the selected bills is no longer available."), { statusCode: 409 });
+      }
+      for (const targetId of targetCheckIds) {
+        const targetState = checkState(session, targetId);
+        if (targetState.status !== "open" ||
+            (targetId !== checkId && toMillis(targetState.groupPaymentShareUntil) <= Date.now())) {
+          throw Object.assign(new Error("One of the selected bills is no longer shared or is already being paid."), { statusCode: 409 });
+        }
+      }
+      const paymentGroupId = targetCheckIds.length > 1
+        ? `pg_${crypto.randomBytes(16).toString("hex")}`
+        : null;
+      const checks = { ...(session.checks || {}) };
+      targetCheckIds.forEach((targetId) => {
+        checks[targetId] = {
+          ...checkState(session, targetId),
+          status: "awaiting_payment",
+          billRequestedAt: new Date(),
+          paymentGroupId,
+          paymentGroupPayerCheckId: checkId,
+          groupPaymentShareUntil: null,
+        };
       });
-      return "awaiting_payment";
+      tx.update(sessionRef, {
+        checks,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return {
+        status: "awaiting_payment",
+        checkId,
+        paymentGroupId,
+        billCount: targetCheckIds.length,
+        amount: targetOrders.reduce((sum, snap) => sum + Number(snap.data().total || 0), 0),
+      };
     });
 
-    return res.json({ status });
+    return res.json(result);
   } catch (err) {
     console.error("Request bill error:", err);
     return res.status(err.statusCode || 500).json({
@@ -1929,16 +2476,39 @@ app.post("/request-bill", async (req, res) => {
 app.get("/transfer-details", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
   const restaurantId = String(req.query.restaurantId || "").trim();
   const sessionId = String(req.query.sessionId || "").trim();
-  if (!restaurantId || !sessionId) {
-    return res.status(400).json({ error: "restaurantId and sessionId are required" });
+  const orderId = String(req.query.orderId || "").trim();
+  const accessToken = String(req.query.accessToken || "").trim();
+  const checkSecret = String(req.query.checkSecret || "");
+  if (!restaurantId || !sessionId || !orderId || !accessToken) {
+    return res.status(400).json({ error: "A valid order and table session are required." });
   }
 
   try {
-    const sessionSnap = await db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`).get();
-    if (!sessionSnap.exists || !["awaiting_payment", "transfer_reported"].includes(sessionSnap.data().status)) {
+    const [sessionSnap, orderSnap] = await Promise.all([
+      db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`).get(),
+      db.doc(`restaurants/${restaurantId}/orders/${orderId}`).get(),
+    ]);
+    const session = sessionSnap.data();
+    if (!session || !orderSnap.exists || orderSnap.data().sessionId !== sessionId ||
+        !hasValidSessionToken(session, accessToken) ||
+        !hasCheckAccess(session, orderCheckId(orderSnap.data()), checkSecret) ||
+        !["awaiting_payment", "transfer_reported"].includes(checkState(session, orderCheckId(orderSnap.data())).status)) {
       return res.status(409).json({ error: "Request the bill before viewing transfer details." });
     }
-    const privateSnap = await db.doc(`restaurants/${restaurantId}/profile/private`).get();
+    const ownCheckId = orderCheckId(orderSnap.data());
+    const ownCheck = checkState(session, ownCheckId);
+    if (ownCheck.paymentGroupId && ownCheck.paymentGroupPayerCheckId !== ownCheckId) {
+      return res.status(403).json({ error: "Another guest is handling this combined payment." });
+    }
+    const groupCheckIds = ownCheck.paymentGroupId
+      ? Object.entries(session.checks || {})
+          .filter(([, state]) => state.paymentGroupId === ownCheck.paymentGroupId)
+          .map(([id]) => id)
+      : [ownCheckId];
+    const [privateSnap, ...orderSnaps] = await Promise.all([
+      db.doc(`restaurants/${restaurantId}/profile/private`).get(),
+      ...(session.orderIds || []).map((id) => db.doc(`restaurants/${restaurantId}/orders/${id}`).get()),
+    ]);
     const bank = privateSnap.exists ? privateSnap.data() : {};
     if (!bank.bankName || !bank.accountName || !bank.accountNumber) {
       return res.status(404).json({ error: "Bank transfer is not configured for this restaurant." });
@@ -1947,6 +2517,11 @@ app.get("/transfer-details", rateLimit({ windowMs: 60_000, max: 30 }), async (re
       bankName: String(bank.bankName),
       accountName: String(bank.accountName),
       accountNumber: String(bank.accountNumber),
+      amount: orderSnaps.filter((snap) => snap.exists &&
+        groupCheckIds.includes(orderCheckId(snap.data())) &&
+        snap.data().status !== "cancelled" && snap.data().paymentStatus !== "paid")
+        .reduce((sum, snap) => sum + Number(snap.data().total || 0), 0),
+      billCount: groupCheckIds.length,
     });
   } catch (err) {
     console.error("Transfer details error:", err);
@@ -1958,23 +2533,55 @@ app.get("/transfer-details", rateLimit({ windowMs: 60_000, max: 30 }), async (re
 app.post("/report-transfer", rateLimit({ windowMs: 60_000, max: 5 }), async (req, res) => {
   const restaurantId = String(req.body?.restaurantId || "").trim();
   const sessionId = String(req.body?.sessionId || "").trim();
+  const orderId = String(req.body?.orderId || "").trim();
+  const accessToken = String(req.body?.accessToken || "").trim();
+  const checkSecret = String(req.body?.checkSecret || "");
   const reference = String(req.body?.reference || "").trim().slice(0, 80);
-  if (!restaurantId || !sessionId) {
-    return res.status(400).json({ error: "restaurantId and sessionId are required" });
+  if (!restaurantId || !sessionId || !orderId || !accessToken || !reference) {
+    return res.status(400).json({ error: "Order and transfer reference are required." });
   }
 
   try {
     await db.runTransaction(async (tx) => {
       const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
-      const sessionSnap = await tx.get(sessionRef);
-      if (!sessionSnap.exists || sessionSnap.data().status !== "awaiting_payment") {
-        throw Object.assign(new Error("This table is not awaiting payment."), { statusCode: 409 });
+      const orderRef = db.doc(`restaurants/${restaurantId}/orders/${orderId}`);
+      const [sessionSnap, orderSnap] = await Promise.all([tx.get(sessionRef), tx.get(orderRef)]);
+      const session = sessionSnap.data();
+      if (!session || !orderSnap.exists || orderSnap.data().sessionId !== sessionId ||
+          !hasValidSessionToken(session, accessToken)) {
+        throw Object.assign(new Error("Order access has expired."), { statusCode: 403 });
       }
+      const checkId = orderCheckId(orderSnap.data());
+      if (!hasCheckAccess(session, checkId, checkSecret)) {
+        throw Object.assign(new Error("This check belongs to another guest."), { statusCode: 403 });
+      }
+      const currentCheck = checkState(session, checkId);
+      if (currentCheck.status !== "awaiting_payment") {
+        throw Object.assign(new Error("This check is not awaiting payment."), { statusCode: 409 });
+      }
+      if (currentCheck.paymentGroupId && currentCheck.paymentGroupPayerCheckId !== checkId) {
+        throw Object.assign(new Error("Another guest is handling this combined payment."), { statusCode: 403 });
+      }
+      const groupCheckIds = currentCheck.paymentGroupId
+        ? Object.entries(session.checks || {})
+            .filter(([, state]) => state.paymentGroupId === currentCheck.paymentGroupId)
+            .map(([id]) => id)
+        : [checkId];
+      if (groupCheckIds.some((id) => checkState(session, id).status !== "awaiting_payment")) {
+        throw Object.assign(new Error("One of these bills is no longer awaiting payment."), { statusCode: 409 });
+      }
+      const checks = { ...(session.checks || {}) };
+      groupCheckIds.forEach((id) => {
+        checks[id] = {
+          ...checkState(session, id),
+          status: "transfer_reported",
+          transferReportedAt: new Date(),
+          transferReference: reference,
+        };
+      });
       tx.update(sessionRef, {
-        status: "transfer_reported",
-        transferReportedAt: FieldValue.serverTimestamp(),
+        checks,
         updatedAt: FieldValue.serverTimestamp(),
-        transferReference: reference || null,
       });
     });
     return res.json({ success: true, status: "transfer_reported" });
@@ -2015,139 +2622,251 @@ app.post("/call-waiter", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
   }
 });
 
-// POST /close-table-session — staff-only, the only path to mark a table paid
-app.post("/close-table-session", requireFirebaseUser, async (req, res) => {
+// Staff may collect one check or all outstanding checks together. Each order is
+// marked paid exactly once; the table is released after the last check settles.
+app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
   const restaurantId = String(req.body?.restaurantId || "").trim();
   const sessionId = String(req.body?.sessionId || "").trim();
-  const paidVia = req.body?.paidVia;
-  const total = Number(req.body?.total);
+  const orderIds = [...new Set(Array.isArray(req.body?.orderIds) ? req.body.orderIds.map(String) : [])];
+  const checkIds = [...new Set(Array.isArray(req.body?.checkIds) ? req.body.checkIds : [])];
+  const paidVia = String(req.body?.paidVia || "");
+  if (!restaurantId || !sessionId || (!orderIds.length && !checkIds.length) ||
+      checkIds.some((id) => id !== LEGACY_CHECK_ID && !validCheckId(id)) ||
+      !["cash", "pos", "transfer"].includes(paidVia)) {
+    return res.status(400).json({ error: "Select a valid bill and payment method." });
+  }
+  try {
+    if (!(await userCanOperate(req.firebaseUser.uid, restaurantId))) {
+      return res.status(403).json({ error: "Not authorised for this restaurant." });
+    }
+    const receipt = await db.runTransaction(async (tx) => {
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
+      const sessionSnap = await tx.get(sessionRef);
+      if (!sessionSnap.exists || !OPEN_TABLE_SESSION_STATUSES.includes(sessionSnap.data().status)) {
+        throw Object.assign(new Error("This table is already closed."), { statusCode: 409 });
+      }
+      const session = sessionSnap.data();
+      const orderRefs = (session.orderIds || []).map((id) => db.doc(`restaurants/${restaurantId}/orders/${id}`));
+      const [orderSnaps, profileSnap] = await Promise.all([
+        Promise.all(orderRefs.map((ref) => tx.get(ref))),
+        tx.get(db.doc(`restaurants/${restaurantId}/profile/info`)),
+      ]);
+      const tableRef = db.doc(`restaurants/${restaurantId}/tables/${session.table}`);
+      const tableSnap = await tx.get(tableRef);
+      const active = orderSnaps.filter((snap) => snap.exists && snap.data().status !== "cancelled");
+      const unpaid = active.filter((snap) => snap.data().paymentStatus !== "paid");
+      const selected = orderIds.length
+        ? unpaid.filter((snap) => orderIds.includes(snap.id))
+        : unpaid.filter((snap) => checkIds.includes(orderCheckId(snap.data())));
+      if (!selected.length ||
+          (orderIds.length && orderIds.some((id) => !selected.some((snap) => snap.id === id))) ||
+          (!orderIds.length && checkIds.some((id) => !selected.some((snap) => orderCheckId(snap.data()) === id)))) {
+        throw Object.assign(new Error("This bill has no unpaid orders."), { statusCode: 409 });
+      }
+      const selectedCheckIds = [...new Set(selected.map((snap) => orderCheckId(snap.data())))];
+      const selectedPaymentGroups = [...new Set(selectedCheckIds
+        .map((id) => checkState(session, id).paymentGroupId)
+        .filter(Boolean))];
+      for (const paymentGroupId of selectedPaymentGroups) {
+        const groupCheckIds = Object.entries(session.checks || {})
+          .filter(([, state]) => state.paymentGroupId === paymentGroupId && state.status !== "paid")
+          .map(([id]) => id);
+        if (groupCheckIds.some((id) => !selectedCheckIds.includes(id))) {
+          throw Object.assign(
+            new Error("All bills in this combined payment must be confirmed together."),
+            { statusCode: 409 },
+          );
+        }
+      }
+      const reportedChecks = selectedCheckIds.filter((id) => checkState(session, id).status === "transfer_reported");
+      if (paidVia === "transfer" && (reportedChecks.length === 0 ||
+          (!selectedCheckIds.every((id) => reportedChecks.includes(id)) && selected.length !== unpaid.length))) {
+        throw Object.assign(new Error("A transfer must be reported for this bill. For one payer covering every bill, select all outstanding orders and verify the full amount."), { statusCode: 409 });
+      }
+      const amount = selected.reduce((sum, snap) => sum + Number(snap.data().total || 0), 0);
+      const allSettled = selected.length === unpaid.length;
+      const selectedOrderIds = new Set(selected.map((snap) => snap.id));
+      const settlementMethods = new Set(active.map((snap) =>
+        selectedOrderIds.has(snap.id) ? paidVia : snap.data().paidVia,
+      ).filter(Boolean));
+      const checks = { ...(session.checks || {}) };
+      selectedCheckIds.forEach((id) => {
+        const unpaidForCheck = unpaid.filter((snap) => orderCheckId(snap.data()) === id);
+        const selectedForCheck = selected.filter((snap) => orderCheckId(snap.data()) === id);
+        const checkAmount = selectedForCheck
+          .reduce((sum, snap) => sum + Number(snap.data().total || 0), 0);
+        // Legacy orders share one fallback check state. Do not mark that state
+        // paid while another guest's legacy bill is still outstanding.
+        if (selectedForCheck.length === unpaidForCheck.length) {
+          checks[id] = { ...checkState(session, id), status: "paid", paidVia, paidAt: new Date(), amount: checkAmount,
+            settledOrders: selectedForCheck.length };
+        }
+      });
+      selected.forEach((snap) => tx.update(snap.ref, {
+        paymentStatus: "paid", paidVia, paidAt: FieldValue.serverTimestamp(),
+      }));
+      tx.update(sessionRef, {
+        checks,
+        amountPaid: FieldValue.increment(amount),
+        ...(allSettled ? {
+          status: "paid", closedAt: FieldValue.serverTimestamp(),
+          paidVia: settlementMethods.size > 1 ? "mixed" : [...settlementMethods][0] || paidVia,
+          closedByUid: req.firebaseUser.uid, waiterCalledAt: null,
+        } : {}),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      if (allSettled) {
+        if (tableSnap.data()?.currentSessionId === sessionId) {
+          tx.set(tableRef, { currentSessionId: null, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+        }
+      }
+      const dayKey = lagosDayKey();
+      tx.set(db.doc(`restaurants/${restaurantId}/dailySummaries/${dayKey}`), {
+        dateKey: dayKey,
+        totalRevenue: FieldValue.increment(amount),
+        [paymentRevenueField(paidVia)]: FieldValue.increment(amount),
+        settledOrders: FieldValue.increment(selected.length),
+        ...(allSettled ? { settledTables: FieldValue.increment(1) } : {}),
+        lastSettlementAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      return {
+        restaurantName: profileSnap.data()?.name || restaurantId,
+        table: session.table,
+        orders: selected.map((snap) => ({
+          customerName: snap.data().customerName || "Guest",
+          items: snap.data().items || [],
+          total: Number(snap.data().total || 0),
+        })),
+        totalBill: amount,
+        settledOrderIds: selected.map((snap) => snap.id),
+        paidVia,
+        tableClosed: allSettled,
+        closedAt: new Date().toISOString(),
+      };
+    });
+    return res.json({ success: true, ...receipt });
+  } catch (err) {
+    console.error("Settle checks error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not settle checks." });
+  }
+});
 
+// End an unused table visit without creating a payment or receipt. This route
+// is intentionally limited to sessions where every linked order was cancelled.
+app.post("/close-empty-table-session", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const sessionId = String(req.body?.sessionId || "").trim();
   if (!restaurantId || !sessionId) {
-    return res.status(400).json({ error: "restaurantId and sessionId are required" });
-  }
-  if (!["cash", "pos", "transfer", "online"].includes(paidVia)) {
-    return res
-      .status(400)
-      .json({ error: "paidVia must be 'cash', 'pos' or 'transfer'" });
-  }
-  if (!Number.isFinite(total) || total < 0) {
-    return res.status(400).json({ error: "Invalid confirmed total." });
+    return res.status(400).json({ error: "A restaurant and table session are required." });
   }
 
   try {
     if (!(await userCanOperate(req.firebaseUser.uid, restaurantId))) {
-      return res.status(403).json({ error: "Not authorized for this restaurant" });
+      return res.status(403).json({ error: "Not authorised for this restaurant." });
     }
 
-    const receipt = await db.runTransaction(async (tx) => {
+    const result = await db.runTransaction(async (tx) => {
       const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
       const sessionSnap = await tx.get(sessionRef);
-      if (!sessionSnap.exists) {
-        throw Object.assign(new Error("Table session not found."), { statusCode: 404 });
-      }
-      const session = sessionSnap.data();
-      if (session.status === "paid") {
-        throw Object.assign(new Error("Table session is already closed."), {
-          statusCode: 409,
-        });
-      }
-      if (paidVia === "transfer" && session.status !== "transfer_reported") {
-        throw Object.assign(new Error("The diner must report the transfer before staff can confirm it."), {
-          statusCode: 409,
-        });
+      if (!sessionSnap.exists || !OPEN_TABLE_SESSION_STATUSES.includes(sessionSnap.data().status)) {
+        throw Object.assign(new Error("This table is already closed."), { statusCode: 409 });
       }
 
-      const orderIds = Array.isArray(session.orderIds) ? session.orderIds : [];
-      const orderRefs = orderIds.map((id) =>
+      const session = sessionSnap.data();
+      const orderRefs = (session.orderIds || []).map((id) =>
         db.doc(`restaurants/${restaurantId}/orders/${id}`),
       );
-      const orderSnaps = orderRefs.length
-        ? await Promise.all(orderRefs.map((ref) => tx.get(ref)))
-        : [];
-      const profileSnap = await tx.get(db.doc(`restaurants/${restaurantId}/profile/info`));
+      const orderSnaps = await Promise.all(orderRefs.map((ref) => tx.get(ref)));
+      const billableOrders = orderSnaps.filter(
+        (snap) => snap.exists &&
+          (snap.data().status !== "cancelled" || snap.data().paymentStatus === "paid"),
+      );
+      if (billableOrders.length > 0 || Number(session.amountPaid || 0) > 0) {
+        throw Object.assign(
+          new Error("This table has billable orders. Collect payment instead of closing it without charge."),
+          { statusCode: 409 },
+        );
+      }
 
+      const tableRef = db.doc(`restaurants/${restaurantId}/tables/${session.table}`);
+      const tableSnap = await tx.get(tableRef);
       tx.update(sessionRef, {
-        status: "paid",
+        status: "closed",
+        totalBill: 0,
+        amountPaid: 0,
+        paidVia: null,
+        closeReason: "all_orders_cancelled",
         closedAt: FieldValue.serverTimestamp(),
-        paidVia,
         closedByUid: req.firebaseUser.uid,
-        totalBill: total,
-        // Bill settled — any outstanding "call waiter" is answered by definition.
         waiterCalledAt: null,
+        updatedAt: FieldValue.serverTimestamp(),
       });
+      if (tableSnap.exists && tableSnap.data()?.currentSessionId === sessionId) {
+        tx.set(
+          tableRef,
+          { currentSessionId: null, updatedAt: FieldValue.serverTimestamp() },
+          { merge: true },
+        );
+      }
 
-      orderSnaps.forEach((snap) => {
-        // Cancelled orders were never paid for — leave them out of the settlement.
-        if (snap.exists && snap.data().status !== "cancelled") {
-          tx.update(snap.ref, { paymentStatus: "paid", paidVia });
-        }
-      });
-
-      tx.set(
-        db.doc(`restaurants/${restaurantId}/tables/${session.table}`),
-        { currentSessionId: null, updatedAt: FieldValue.serverTimestamp() },
-        { merge: true },
-      );
-
-      const settledOrderCount = orderSnaps.filter(
-        (snap) => snap.exists && snap.data().status !== "cancelled",
-      ).length;
-      const dayKey = lagosDayKey();
-      // One session can only transition to paid once, so this transaction is an
-      // idempotent source of truth for the daily reconciliation rollup.
-      tx.set(
-        db.doc(`restaurants/${restaurantId}/dailySummaries/${dayKey}`),
-        {
-          dateKey: dayKey,
-          totalRevenue: FieldValue.increment(total),
-          [paymentRevenueField(paidVia)]: FieldValue.increment(total),
-          settledTables: FieldValue.increment(1),
-          settledOrders: FieldValue.increment(settledOrderCount),
-          lastSettlementAt: FieldValue.serverTimestamp(),
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true },
-      );
-
-      // Receipt bills are grouped per guest: same email = one bill, different
-      // guests (email, else name) stay separate.
-      const groups = new Map();
-      orderSnaps
-        .filter((snap) => snap.exists && snap.data().status !== "cancelled")
-        .forEach((snap) => {
-          const o = snap.data();
-          const email = String(o.email || "").trim().toLowerCase();
-          const name = String(o.customerName || "").trim().toLowerCase();
-          const key = email ? `e:${email}` : name ? `n:${name}` : `o:${snap.id}`;
-          if (!groups.has(key)) {
-            groups.set(key, {
-              customerName: o.customerName || "Guest",
-              items: [],
-              total: 0,
-            });
-          }
-          const g = groups.get(key);
-          g.items.push(...(o.items || []));
-          g.total += Number(o.total || 0);
-        });
-
-      return {
-        restaurantName: profileSnap.data()?.name || restaurantId,
-        table: session.table,
-        orders: [...groups.values()],
-        totalBill: total,
-        paidVia,
-        closedAt: new Date().toISOString(),
-      };
+      return { table: session.table };
     });
 
-    return res.json({ success: true, ...receipt });
+    return res.json({ success: true, table: result.table, receipt: null });
   } catch (err) {
-    console.error("Close table session error:", err);
+    console.error("Close empty table session error:", err);
     return res.status(err.statusCode || 500).json({
-      error: err.message || "Could not close table session.",
+      error: err.message || "Could not close this table.",
     });
   }
+});
+
+app.post("/move-order-check", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const sessionId = String(req.body?.sessionId || "").trim();
+  const orderId = String(req.body?.orderId || "").trim();
+  const targetCheckId = String(req.body?.targetCheckId || "").trim();
+  if (!restaurantId || !sessionId || !orderId || !validCheckId(targetCheckId)) {
+    return res.status(400).json({ error: "Select an order and an open check." });
+  }
+  try {
+    if (!(await userCanOperate(req.firebaseUser.uid, restaurantId))) {
+      return res.status(403).json({ error: "Not authorised for this restaurant." });
+    }
+    await db.runTransaction(async (tx) => {
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
+      const orderRef = db.doc(`restaurants/${restaurantId}/orders/${orderId}`);
+      const [sessionSnap, orderSnap] = await Promise.all([tx.get(sessionRef), tx.get(orderRef)]);
+      const session = sessionSnap.data();
+      const order = orderSnap.data();
+      if (!session || !order || session.status !== "open" || order.sessionId !== sessionId ||
+          order.status === "cancelled" || order.paymentStatus === "paid" ||
+          !session.orderIds?.includes(orderId) ||
+          checkState(session, orderCheckId(order)).status !== "open" ||
+          checkState(session, targetCheckId).status !== "open") {
+        throw Object.assign(new Error("Only unpaid orders on open checks can be moved."), { statusCode: 409 });
+      }
+      const targetExists = Object.prototype.hasOwnProperty.call(session.checks || {}, targetCheckId);
+      if (!targetExists) {
+        throw Object.assign(new Error("Target check does not exist on this table."), { statusCode: 409 });
+      }
+      tx.update(orderRef, { checkId: targetCheckId, updatedAt: FieldValue.serverTimestamp() });
+      tx.update(sessionRef, {
+        checks: { ...(session.checks || {}), [targetCheckId]: { status: "open" } },
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Move order check error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not move order." });
+  }
+});
+
+// Retired in favor of check-level settlement. Do not accept client-supplied totals.
+app.post("/close-table-session", requireFirebaseUser, (_req, res) => {
+  return res.status(410).json({ error: "Use check-level settlement to close a table." });
 });
 
 // POST /rebuild-daily-summaries — management-only historical backfill. This is
@@ -2170,34 +2889,45 @@ app.post("/rebuild-daily-summaries", requireFirebaseUser, async (req, res) => {
     const start = new Date();
     start.setDate(start.getDate() - (days - 1));
     start.setHours(0, 0, 0, 0);
-    const sessions = await db
-      .collection(`restaurants/${restaurantId}/tableSessions`)
-      .where("closedAt", ">=", start)
-      .get();
+    const sessionCollection = db.collection(`restaurants/${restaurantId}/tableSessions`);
+    const [closedSessions, updatedSessions] = await Promise.all([
+      sessionCollection.where("closedAt", ">=", start).get(),
+      sessionCollection.where("updatedAt", ">=", start).get(),
+    ]);
+    const sessions = new Map([...closedSessions.docs, ...updatedSessions.docs].map((snap) => [snap.id, snap]));
     const totals = new Map();
+    const summaryFor = (dayKey) => {
+      if (!totals.has(dayKey)) totals.set(dayKey, {
+        totalRevenue: 0, cashRevenue: 0, posRevenue: 0, transferRevenue: 0,
+        onlineRevenue: 0, otherRevenue: 0, settledTables: 0, settledOrders: 0,
+      });
+      return totals.get(dayKey);
+    };
 
     sessions.forEach((snap) => {
       const session = snap.data();
-      if (session.status !== "paid") return;
+      const paidChecks = Object.values(session.checks || {}).filter((check) =>
+        check.status === "paid" && Number.isFinite(Number(check.amount)));
+      if (paidChecks.length) {
+        paidChecks.filter((check) => toMillis(check.paidAt) >= start.getTime()).forEach((check) => {
+          const current = summaryFor(lagosDayKey(toMillis(check.paidAt)));
+          current.totalRevenue += Number(check.amount);
+          current[paymentRevenueField(check.paidVia)] += Number(check.amount);
+          current.settledOrders += Number(check.settledOrders || 0);
+        });
+        if (session.status === "paid" && toMillis(session.closedAt) >= start.getTime()) {
+          summaryFor(lagosDayKey(toMillis(session.closedAt))).settledTables += 1;
+        }
+        return;
+      }
+      if (session.status !== "paid" || toMillis(session.closedAt) < start.getTime()) return;
       const total = Number(session.totalBill);
       if (!Number.isFinite(total) || total < 0) return;
-
-      const dayKey = lagosDayKey(toMillis(session.closedAt));
-      const current = totals.get(dayKey) || {
-        totalRevenue: 0,
-        cashRevenue: 0,
-        posRevenue: 0,
-        transferRevenue: 0,
-        onlineRevenue: 0,
-        otherRevenue: 0,
-        settledTables: 0,
-        settledOrders: 0,
-      };
+      const current = summaryFor(lagosDayKey(toMillis(session.closedAt)));
       current.totalRevenue += total;
       current[paymentRevenueField(session.paidVia)] += total;
       current.settledTables += 1;
       current.settledOrders += Array.isArray(session.orderIds) ? session.orderIds.length : 0;
-      totals.set(dayKey, current);
     });
 
     const writes = [...totals.entries()];
