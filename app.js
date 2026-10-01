@@ -4,6 +4,7 @@ const cors = require("cors");
 const crypto = require("crypto");
 const { Resend } = require("resend");
 const admin = require("firebase-admin");
+const { canClosePaidTable, statusAfterServing } = require("./orderLifecycle");
 
 //admin.initializeApp({
 //  credential: admin.credential.cert(
@@ -226,6 +227,18 @@ const paymentRevenueField = (paidVia) =>
     transfer: "transferRevenue",
     online: "onlineRevenue",
   })[paidVia] || "otherRevenue";
+
+const queuePaidTableRelease = (tx, restaurantId, sessionId, tableRef, tableSnap) => {
+  if (tableSnap.data()?.currentSessionId === sessionId) {
+    tx.set(tableRef, { currentSessionId: null, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+  }
+  const dayKey = lagosDayKey();
+  tx.set(db.doc(`restaurants/${restaurantId}/dailySummaries/${dayKey}`), {
+    dateKey: dayKey,
+    settledTables: FieldValue.increment(1),
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+};
 
 // Revenue is reported against the venue's operating day, not UTC. Servrr's
 // current market is Nigeria, so the reconciliation key follows Lagos time.
@@ -2249,11 +2262,34 @@ app.post("/cancel-order", rateLimit({ windowMs: 60_000, max: 10 }), async (req, 
           checkState(session, orderCheckId(order)).status !== "open") {
         throw Object.assign(new Error("This order can no longer be cancelled."), { statusCode: 409 });
       }
+      if (!session.orderIds?.includes(orderId)) {
+        throw Object.assign(new Error("Order is not linked to this table."), { statusCode: 409 });
+      }
+      const orderSnaps = await Promise.all(session.orderIds.map((id) =>
+        tx.get(db.doc(`restaurants/${restaurantId}/orders/${id}`)),
+      ));
+      if (orderSnaps.some((snap) => !snap.exists)) {
+        throw Object.assign(new Error("Table order history is incomplete."), { statusCode: 409 });
+      }
+      const tableRef = db.doc(`restaurants/${restaurantId}/tables/${session.table}`);
+      const tableSnap = await tx.get(tableRef);
+      const remainingOrders = orderSnaps.map((snap) =>
+        snap.id === orderId ? { ...snap.data(), status: "cancelled" } : snap.data(),
+      );
+      const tableClosed = canClosePaidTable(remainingOrders);
+      const paidVia = [...new Set(remainingOrders.filter((item) => item.status !== "cancelled")
+        .map((item) => item.paidVia).filter(Boolean))];
       tx.update(orderRef, { status: "cancelled", updatedAt: FieldValue.serverTimestamp() });
       tx.update(sessionRef, {
         totalBill: FieldValue.increment(-Number(order.total || 0)),
+        ...(tableClosed ? {
+          status: "paid", paidVia: paidVia.length > 1 ? "mixed" : paidVia[0] || (session.paymentMode === "pay_online" ? "online" : null),
+          closedAt: FieldValue.serverTimestamp(), closedByUid: null,
+          closeReason: "all_orders_served_and_paid", waiterCalledAt: null,
+        } : {}),
         updatedAt: FieldValue.serverTimestamp(),
       });
+      if (tableClosed) queuePaidTableRelease(tx, restaurantId, sessionId, tableRef, tableSnap);
     });
     return res.json({ success: true });
   } catch (err) {
@@ -2622,8 +2658,143 @@ app.post("/call-waiter", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
   }
 });
 
+app.post("/cancel-table-order", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const orderId = String(req.body?.orderId || "").trim();
+  if (!restaurantId || !orderId) {
+    return res.status(400).json({ error: "A restaurant and order are required." });
+  }
+  try {
+    if (!(await userCanOperate(req.firebaseUser.uid, restaurantId))) {
+      return res.status(403).json({ error: "Not authorised for this restaurant." });
+    }
+    const result = await db.runTransaction(async (tx) => {
+      const orderRef = db.doc(`restaurants/${restaurantId}/orders/${orderId}`);
+      const orderSnap = await tx.get(orderRef);
+      if (!orderSnap.exists) {
+        throw Object.assign(new Error("Order not found."), { statusCode: 404 });
+      }
+      const order = orderSnap.data();
+      if (order.status === "cancelled") return { tableClosed: false };
+      if (!["pending", "in_progress", "ready"].includes(order.status) ||
+          order.paymentStatus === "paid" || !order.sessionId) {
+        throw Object.assign(new Error("This order cannot be cancelled after service or payment."), { statusCode: 409 });
+      }
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${order.sessionId}`);
+      const sessionSnap = await tx.get(sessionRef);
+      if (!sessionSnap.exists || !OPEN_TABLE_SESSION_STATUSES.includes(sessionSnap.data().status)) {
+        throw Object.assign(new Error("This table is already closed."), { statusCode: 409 });
+      }
+      const session = sessionSnap.data();
+      if (!session.orderIds?.includes(orderId) || checkState(session, orderCheckId(order)).status !== "open") {
+        throw Object.assign(new Error("Resolve this bill before cancelling the order."), { statusCode: 409 });
+      }
+      const orderSnaps = await Promise.all(session.orderIds.map((id) =>
+        tx.get(db.doc(`restaurants/${restaurantId}/orders/${id}`)),
+      ));
+      if (orderSnaps.some((snap) => !snap.exists)) {
+        throw Object.assign(new Error("Table order history is incomplete."), { statusCode: 409 });
+      }
+      const tableRef = db.doc(`restaurants/${restaurantId}/tables/${session.table}`);
+      const tableSnap = await tx.get(tableRef);
+      const remainingOrders = orderSnaps.map((snap) =>
+        snap.id === orderId ? { ...snap.data(), status: "cancelled" } : snap.data(),
+      );
+      const tableClosed = canClosePaidTable(remainingOrders);
+      const methods = [...new Set(remainingOrders.filter((item) => item.status !== "cancelled")
+        .map((item) => item.paidVia).filter(Boolean))];
+      tx.update(orderRef, { status: "cancelled", updatedAt: FieldValue.serverTimestamp() });
+      tx.update(sessionRef, {
+        totalBill: FieldValue.increment(-Number(order.total || 0)),
+        ...(tableClosed ? {
+          status: "paid", paidVia: methods.length > 1 ? "mixed" : methods[0] || (session.paymentMode === "pay_online" ? "online" : null),
+          closedAt: FieldValue.serverTimestamp(), closedByUid: req.firebaseUser.uid,
+          closeReason: "all_orders_served_and_paid", waiterCalledAt: null,
+        } : {}),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      if (tableClosed) queuePaidTableRelease(tx, restaurantId, sessionRef.id, tableRef, tableSnap);
+      return { tableClosed };
+    });
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("Cancel table order error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not cancel this order." });
+  }
+});
+
+// Serving and payment can happen in either order. The last action closes the
+// visit only after every non-cancelled order is both served and paid.
+app.post("/mark-order-served", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const orderId = String(req.body?.orderId || "").trim();
+  if (!restaurantId || !orderId) {
+    return res.status(400).json({ error: "A restaurant and order are required." });
+  }
+  try {
+    if (!(await userCanOperate(req.firebaseUser.uid, restaurantId))) {
+      return res.status(403).json({ error: "Not authorised for this restaurant." });
+    }
+    const result = await db.runTransaction(async (tx) => {
+      const orderRef = db.doc(`restaurants/${restaurantId}/orders/${orderId}`);
+      const orderSnap = await tx.get(orderRef);
+      if (!orderSnap.exists) {
+        throw Object.assign(new Error("Order not found."), { statusCode: 404 });
+      }
+      const order = orderSnap.data();
+      if (["served", "completed"].includes(order.status)) {
+        return { status: order.status, tableClosed: false };
+      }
+      if (order.status !== "ready" || !order.sessionId) {
+        throw Object.assign(new Error("Only a ready order can be marked served."), { statusCode: 409 });
+      }
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${order.sessionId}`);
+      const sessionSnap = await tx.get(sessionRef);
+      if (!sessionSnap.exists || !OPEN_TABLE_SESSION_STATUSES.includes(sessionSnap.data().status)) {
+        throw Object.assign(new Error("This table is already closed."), { statusCode: 409 });
+      }
+      const session = sessionSnap.data();
+      if (!session.orderIds?.includes(orderId)) {
+        throw Object.assign(new Error("Order is not linked to this table."), { statusCode: 409 });
+      }
+      const orderRefs = session.orderIds.map((id) => db.doc(`restaurants/${restaurantId}/orders/${id}`));
+      const orderSnaps = await Promise.all(orderRefs.map((ref) => tx.get(ref)));
+      if (orderSnaps.some((snap) => !snap.exists)) {
+        throw Object.assign(new Error("Table order history is incomplete."), { statusCode: 409 });
+      }
+      const tableRef = db.doc(`restaurants/${restaurantId}/tables/${session.table}`);
+      const tableSnap = await tx.get(tableRef);
+      const nextStatus = statusAfterServing(order);
+      const nextOrders = orderSnaps.map((snap) =>
+        snap.id === orderId ? { ...snap.data(), status: nextStatus } : snap.data(),
+      );
+      const tableClosed = canClosePaidTable(nextOrders);
+      tx.update(orderRef, { status: nextStatus, servedAt: FieldValue.serverTimestamp() });
+      if (tableClosed) {
+        const methods = new Set(nextOrders.filter((item) => item.status !== "cancelled")
+          .map((item) => item.paidVia).filter(Boolean));
+        tx.update(sessionRef, {
+          status: "paid",
+          paidVia: methods.size > 1 ? "mixed" : [...methods][0] || session.paidVia || (session.paymentMode === "pay_online" ? "online" : null),
+          closedAt: FieldValue.serverTimestamp(),
+          closedByUid: req.firebaseUser.uid,
+          closeReason: "all_orders_served_and_paid",
+          waiterCalledAt: null,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        queuePaidTableRelease(tx, restaurantId, sessionRef.id, tableRef, tableSnap);
+      }
+      return { status: nextStatus, tableClosed };
+    });
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("Mark order served error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not mark order served." });
+  }
+});
+
 // Staff may collect one check or all outstanding checks together. Each order is
-// marked paid exactly once; the table is released after the last check settles.
+// marked paid exactly once. Service can finish before or after collection.
 app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
   const restaurantId = String(req.body?.restaurantId || "").trim();
   const sessionId = String(req.body?.sessionId || "").trim();
@@ -2651,6 +2822,9 @@ app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
         Promise.all(orderRefs.map((ref) => tx.get(ref))),
         tx.get(db.doc(`restaurants/${restaurantId}/profile/info`)),
       ]);
+      if (orderSnaps.some((snap) => !snap.exists)) {
+        throw Object.assign(new Error("Table order history is incomplete."), { statusCode: 409 });
+      }
       const tableRef = db.doc(`restaurants/${restaurantId}/tables/${session.table}`);
       const tableSnap = await tx.get(tableRef);
       const active = orderSnaps.filter((snap) => snap.exists && snap.data().status !== "cancelled");
@@ -2684,8 +2858,12 @@ app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
         throw Object.assign(new Error("A transfer must be reported for this bill. For one payer covering every bill, select all outstanding orders and verify the full amount."), { statusCode: 409 });
       }
       const amount = selected.reduce((sum, snap) => sum + Number(snap.data().total || 0), 0);
-      const allSettled = selected.length === unpaid.length;
       const selectedOrderIds = new Set(selected.map((snap) => snap.id));
+      const allSettled = selected.length === unpaid.length;
+      const tableClosed = allSettled && canClosePaidTable(orderSnaps.filter((snap) => snap.exists).map((snap) => ({
+        ...snap.data(),
+        ...(selectedOrderIds.has(snap.id) ? { paymentStatus: "paid" } : {}),
+      })));
       const settlementMethods = new Set(active.map((snap) =>
         selectedOrderIds.has(snap.id) ? paidVia : snap.data().paidVia,
       ).filter(Boolean));
@@ -2704,18 +2882,19 @@ app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
       });
       selected.forEach((snap) => tx.update(snap.ref, {
         paymentStatus: "paid", paidVia, paidAt: FieldValue.serverTimestamp(),
+        ...(snap.data().status === "served" ? { status: "completed" } : {}),
       }));
       tx.update(sessionRef, {
         checks,
         amountPaid: FieldValue.increment(amount),
-        ...(allSettled ? {
+        ...(tableClosed ? {
           status: "paid", closedAt: FieldValue.serverTimestamp(),
           paidVia: settlementMethods.size > 1 ? "mixed" : [...settlementMethods][0] || paidVia,
-          closedByUid: req.firebaseUser.uid, waiterCalledAt: null,
+          closedByUid: req.firebaseUser.uid, closeReason: "all_orders_served_and_paid", waiterCalledAt: null,
         } : {}),
         updatedAt: FieldValue.serverTimestamp(),
       });
-      if (allSettled) {
+      if (tableClosed) {
         if (tableSnap.data()?.currentSessionId === sessionId) {
           tx.set(tableRef, { currentSessionId: null, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
         }
@@ -2726,7 +2905,7 @@ app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
         totalRevenue: FieldValue.increment(amount),
         [paymentRevenueField(paidVia)]: FieldValue.increment(amount),
         settledOrders: FieldValue.increment(selected.length),
-        ...(allSettled ? { settledTables: FieldValue.increment(1) } : {}),
+        ...(tableClosed ? { settledTables: FieldValue.increment(1) } : {}),
         lastSettlementAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
@@ -2741,7 +2920,7 @@ app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
         totalBill: amount,
         settledOrderIds: selected.map((snap) => snap.id),
         paidVia,
-        tableClosed: allSettled,
+        tableClosed,
         closedAt: new Date().toISOString(),
       };
     });
