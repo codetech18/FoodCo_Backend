@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const { Resend } = require("resend");
 const admin = require("firebase-admin");
 const { canClosePaidTable, statusAfterServing } = require("./orderLifecycle");
+const { planMatchesCheckout, isSuccessfulSubscriptionCharge } = require("./subscriptionBilling");
 
 //admin.initializeApp({
 //  credential: admin.credential.cert(
@@ -1261,22 +1262,32 @@ app.post("/subscription-checkout", requireFirebaseUser, async (req, res) => {
     if (profile.paystackSubscriptionCode && ["active", "non_renewing"].includes(profile.subscriptionStatus)) {
       return res.status(409).json({ error: "Automatic billing is already active. Use Manage billing to update or cancel it." });
     }
-    if (profile.pendingSubscriptionReference && profile.pendingSubscriptionCycle === requestedCycle) {
-      const pendingSnap = await db.doc(`subscriptionCheckouts/${profile.pendingSubscriptionReference}`).get();
-      const pending = pendingSnap.data();
-      if (pendingSnap.exists && pending?.status === "initialized" && pending?.authorizationUrl) {
-        return res.json({
-          authorizationUrl: pending.authorizationUrl,
-          reference: profile.pendingSubscriptionReference,
-        });
-      }
-    }
     const config = getSubscriptionConfig(profile.businessType, requestedCycle);
     if (!config.planCode) {
       return res.status(503).json({ error: "Subscription billing is not configured yet. Please contact support." });
     }
     if (!process.env.PAYSTACK_SECRET_KEY) {
       return res.status(503).json({ error: "Subscription billing is not configured yet. Please contact support." });
+    }
+    const planResponse = await fetch(`https://api.paystack.co/plan/${encodeURIComponent(config.planCode)}`, {
+      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
+    });
+    const planPayload = await planResponse.json();
+    if (!planResponse.ok || !planPayload.status || !planMatchesCheckout(planPayload.data, config)) {
+      return res.status(503).json({ error: "The billing plan does not match the displayed price. Please contact support." });
+    }
+    if (profile.pendingSubscriptionReference && profile.pendingSubscriptionCycle === requestedCycle) {
+      const pendingSnap = await db.doc(`subscriptionCheckouts/${profile.pendingSubscriptionReference}`).get();
+      const pending = pendingSnap.data();
+      const ageMs = Date.now() - (pending?.createdAt?.toDate?.()?.getTime() || 0);
+      if (pendingSnap.exists && pending?.status === "initialized" && pending?.authorizationUrl &&
+          pending.planCode === config.planCode && pending.amountKobo === config.amountNaira * 100 &&
+          ageMs >= 0 && ageMs < 15 * 60 * 1000) {
+        return res.json({
+          authorizationUrl: pending.authorizationUrl,
+          reference: profile.pendingSubscriptionReference,
+        });
+      }
     }
     const billingEmail = normalizeEmail(req.firebaseUser.email || profile.email);
     if (!billingEmail) return res.status(400).json({ error: "A billing email is required." });
@@ -1290,6 +1301,7 @@ app.post("/subscription-checkout", requireFirebaseUser, async (req, res) => {
         email: billingEmail,
         amount: config.amountNaira * 100,
         plan: config.planCode,
+        channels: ["card"],
         callback_url: `${APP_URL}/${encodeURIComponent(restaurantId)}/admin?subscription=complete`,
         metadata: {
           restaurantId,
@@ -1397,7 +1409,7 @@ app.post("/verify-payment", async (req, res) => {
   }
 });
 
-const resolveSubscriptionContext = async (data, reference) => {
+const resolveSubscriptionContext = async (data, reference, allowEmailFallback = false) => {
   const planCode = planCodeFromPayload(data);
   const subscriptionCode = subscriptionCodeFromPayload(data);
   const customerCode = customerCodeFromPayload(data);
@@ -1415,7 +1427,7 @@ const resolveSubscriptionContext = async (data, reference) => {
     if (customerPlanSnap.exists) return { ...customerPlanSnap.data(), subscriptionCode, customerCode, planCode };
   }
   const customerEmail = normalizeEmail(data?.customer?.email);
-  if (customerEmail && planCode) {
+  if (allowEmailFallback && customerEmail && planCode) {
     const intentSnap = await db.doc(`subscriptionIntents/${subscriptionIntentId(customerEmail, planCode)}`).get();
     if (intentSnap.exists) return { ...intentSnap.data(), subscriptionCode, customerCode, planCode };
   }
@@ -1431,7 +1443,12 @@ const recordSuccessfulSubscriptionPayment = async (data, eventName) => {
 
   const context = await resolveSubscriptionContext(data, reference) ||
     await resolveSubscriptionContext(transaction, reference);
-  if (!context?.restaurantId) return false;
+  if (!context?.restaurantId) {
+    if (subscriptionCodeFromPayload(data) || data?.metadata?.purpose === "servrr_subscription") {
+      throw new Error(`Subscription payment ${reference} has no workspace mapping.`);
+    }
+    return false;
+  }
 
   const config = getSubscriptionConfig(context.businessType, context.billingCycle);
   const receivedPlanCode = planCodeFromPayload(data) || planCodeFromPayload(transaction) || context.planCode;
@@ -1534,10 +1551,12 @@ const recordSuccessfulSubscriptionPayment = async (data, eventName) => {
     }
   });
 
-  await db.doc(`subscriptionCheckouts/${reference}`).set({
-    status: "paid",
-    paidAt: FieldValue.serverTimestamp(),
-  }, { merge: true });
+  if (context.reference === reference) {
+    await db.doc(`subscriptionCheckouts/${reference}`).set({
+      status: "paid",
+      paidAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
   return true;
 };
 
@@ -1556,20 +1575,16 @@ app.post("/paystack-webhook", async (req, res) => {
   const reference = String(transaction?.reference || data?.reference || "").trim();
 
   try {
-    if (eventName === "charge.success") {
-      await recordSuccessfulSubscriptionPayment(data, eventName);
-    }
-
-    if (eventName === "invoice.update" && data.paid === true && data.status === "success") {
+    if (isSuccessfulSubscriptionCharge(eventName, data)) {
       await recordSuccessfulSubscriptionPayment(data, eventName);
     }
 
     if (eventName === "subscription.create") {
-      const context = await resolveSubscriptionContext(data, reference);
+      const context = await resolveSubscriptionContext(data, reference, true);
       const subscriptionCode = subscriptionCodeFromPayload(data);
       const planCode = planCodeFromPayload(data) || context?.planCode;
       const customerCode = customerCodeFromPayload(data) || context?.customerCode;
-      if (context?.restaurantId && subscriptionCode && planCode) {
+      if (context?.restaurantId && subscriptionCode && planCode === context.planCode) {
         const businessType = normalizeSubscriptionType(context.businessType);
         const billingCycle = normalizeSubscriptionCycle(context.billingCycle);
         const batch = db.batch();
@@ -1586,8 +1601,6 @@ app.post("/paystack-webhook", async (req, res) => {
           paystackSubscriptionCode: subscriptionCode,
           paystackCustomerCode: customerCode || null,
           subscriptionPlanCode: planCode,
-          subscriptionAutoRenew: true,
-          subscriptionStatus: "active",
           subscriptionNextPaymentAt: data.next_payment_date ? new Date(data.next_payment_date) : null,
         }, { merge: true });
         if (customerCode) {
@@ -1610,10 +1623,11 @@ app.post("/paystack-webhook", async (req, res) => {
       if (context?.restaurantId) {
         const status = eventName === "invoice.payment_failed"
           ? "past_due"
-          : eventName === "subscription.not_renew" ? "non_renewing" : "cancelled";
+          : eventName === "subscription.not_renew" ? "non_renewing"
+            : data.status === "complete" ? "completed" : "cancelled";
         await db.doc(`restaurants/${context.restaurantId}/profile/info`).set({
           subscriptionStatus: status,
-          subscriptionAutoRenew: eventName === "invoice.payment_failed",
+          ...(eventName !== "invoice.payment_failed" ? { subscriptionAutoRenew: false } : {}),
           subscriptionPaymentFailedAt: eventName === "invoice.payment_failed" ? FieldValue.serverTimestamp() : null,
           subscriptionUpdatedAt: FieldValue.serverTimestamp(),
         }, { merge: true });
