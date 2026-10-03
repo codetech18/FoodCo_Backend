@@ -2672,6 +2672,97 @@ app.post("/call-waiter", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
   }
 });
 
+app.post("/delete-menu-category", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const categoryId = String(req.body?.categoryId || "").trim();
+  if (!restaurantId || !categoryId) return res.status(400).json({ error: "Missing menu category." });
+  try {
+    if (!(await userCanManage(req.firebaseUser.uid, restaurantId))) return res.status(403).json({ error: "Only management can delete categories." });
+    await db.runTransaction(async (tx) => {
+      const categoryRef = db.doc(`restaurants/${restaurantId}/menuCategories/${categoryId}`);
+      const categorySnap = await tx.get(categoryRef);
+      if (!categorySnap.exists) throw Object.assign(new Error("Category not found."), { statusCode: 404 });
+      const menu = db.collection(`restaurants/${restaurantId}/menu`);
+      const legacyName = categorySnap.data().legacyName || categorySnap.data().name;
+      const [assigned, legacy] = await Promise.all([
+        tx.get(menu.where("categoryId", "==", categoryId).limit(1)),
+        tx.get(menu.where("category", "==", legacyName).limit(1)),
+      ]);
+      if (!assigned.empty || !legacy.empty) throw Object.assign(new Error("Move or delete this category's dishes first."), { statusCode: 409 });
+      tx.delete(categoryRef);
+    });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Delete menu category error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not delete category." });
+  }
+});
+
+app.post("/accept-table-order", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const orderId = String(req.body?.orderId || "").trim();
+  const waiterId = req.body?.waiterId == null ? null : String(req.body.waiterId).trim();
+  if (!restaurantId || !orderId || (waiterId !== null && !waiterId)) return res.status(400).json({ error: "Invalid order or waiter." });
+  try {
+    if (!(await userCanOperate(req.firebaseUser.uid, restaurantId))) return res.status(403).json({ error: "Not authorised for this restaurant." });
+    await db.runTransaction(async (tx) => {
+      const orderRef = db.doc(`restaurants/${restaurantId}/orders/${orderId}`);
+      const orderSnap = await tx.get(orderRef);
+      if (!orderSnap.exists || orderSnap.data().status !== "pending") throw Object.assign(new Error("This order is no longer pending."), { statusCode: 409 });
+      const order = orderSnap.data();
+      if (!order.sessionId) {
+        tx.update(orderRef, { status: "in_progress" });
+        return;
+      }
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${order.sessionId}`);
+      const waiterRef = waiterId ? db.doc(`restaurants/${restaurantId}/staff/${waiterId}`) : null;
+      const [sessionSnap, waiterSnap] = await Promise.all([tx.get(sessionRef), waiterRef ? tx.get(waiterRef) : Promise.resolve(null)]);
+      if (!sessionSnap.exists || !OPEN_TABLE_SESSION_STATUSES.includes(sessionSnap.data().status) || !sessionSnap.data().orderIds?.includes(orderId)) {
+        throw Object.assign(new Error("This order is not in an open table session."), { statusCode: 409 });
+      }
+      if (waiterRef && (!waiterSnap.exists || !waiterSnap.data().name)) throw Object.assign(new Error("That waiter is no longer on the roster."), { statusCode: 409 });
+      const assigned = sessionSnap.data().assignedWaiterId || sessionSnap.data().assignedWaiter;
+      if (assigned && waiterId && assigned !== waiterId) throw Object.assign(new Error("This table already has a waiter. Refresh and try again."), { statusCode: 409 });
+      if (!assigned && waiterId) tx.update(sessionRef, {
+        assignedWaiterId: waiterId,
+        assignedWaiter: String(waiterSnap.data().name).trim(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      tx.update(orderRef, { status: "in_progress" });
+    });
+    return res.json({ success: true, status: "in_progress" });
+  } catch (err) {
+    console.error("Accept order error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not accept order." });
+  }
+});
+
+app.post("/assign-table-waiter", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const sessionId = String(req.body?.sessionId || "").trim();
+  const waiterId = req.body?.waiterId == null ? null : String(req.body.waiterId).trim();
+  if (!restaurantId || !sessionId) return res.status(400).json({ error: "Missing table session." });
+  try {
+    if (!(await userCanManage(req.firebaseUser.uid, restaurantId))) return res.status(403).json({ error: "Only managers can reassign a waiter." });
+    await db.runTransaction(async (tx) => {
+      const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
+      const waiterRef = waiterId ? db.doc(`restaurants/${restaurantId}/staff/${waiterId}`) : null;
+      const [sessionSnap, waiterSnap] = await Promise.all([tx.get(sessionRef), waiterRef ? tx.get(waiterRef) : Promise.resolve(null)]);
+      if (!sessionSnap.exists || !OPEN_TABLE_SESSION_STATUSES.includes(sessionSnap.data().status)) throw Object.assign(new Error("This table is no longer open."), { statusCode: 409 });
+      if (waiterRef && (!waiterSnap.exists || !waiterSnap.data().name)) throw Object.assign(new Error("That waiter is no longer on the roster."), { statusCode: 409 });
+      tx.update(sessionRef, {
+        assignedWaiterId: waiterId,
+        assignedWaiter: waiterSnap ? String(waiterSnap.data().name).trim() : null,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Assign waiter error:", err);
+    return res.status(err.statusCode || 500).json({ error: err.message || "Could not assign waiter." });
+  }
+});
+
 app.post("/cancel-table-order", requireFirebaseUser, async (req, res) => {
   const restaurantId = String(req.body?.restaurantId || "").trim();
   const orderId = String(req.body?.orderId || "").trim();
