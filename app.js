@@ -3,36 +3,52 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const { Resend } = require("resend");
-const admin = require("firebase-admin");
+const { initializeApp, cert } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
+const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { canClosePaidTable, statusAfterServing } = require("./orderLifecycle");
 const { planMatchesCheckout, isSuccessfulSubscriptionCharge } = require("./subscriptionBilling");
+const { canReadGuestCheck, guestSessionView, toWire } = require("./guestAccess");
+const { summarizePayments, pendingTransferTotals } = require("./settlementLedger");
+const { receiptsForSettlement, receiptHtml } = require("./receipts");
+const { verifiedMenuItems } = require("./menuItems");
 
-//admin.initializeApp({
-//  credential: admin.credential.cert(
-//    JSON.parse(
-//      (process.env.FIREBASE_SERVICE_ACCOUNT || "").replace(/\\n/g, "\n"),
-//    ),
-//  ),
-//});
-
-let firebaseConfig = process.env.FIREBASE_SERVICE_ACCOUNT || "";
-
-// Remove all whitespace newlines and tabs, but preserve \n as literal characters
-firebaseConfig = firebaseConfig.replace(/\s+/g, " ").trim();
-
-admin.initializeApp({
-  credential: admin.credential.cert(JSON.parse(firebaseConfig)),
-});
+const emulatorMode = process.env.USE_FIREBASE_EMULATORS === "true";
+if (emulatorMode) {
+  if (!process.env.FIRESTORE_EMULATOR_HOST?.startsWith("127.0.0.1:") ||
+      !process.env.FIREBASE_AUTH_EMULATOR_HOST?.startsWith("127.0.0.1:") ||
+      !String(process.env.GCLOUD_PROJECT || "").startsWith("demo-")) {
+    throw new Error("Emulator mode requires loopback Firestore/Auth hosts and a demo project ID.");
+  }
+  initializeApp({ projectId: process.env.GCLOUD_PROJECT });
+  // Local tests cannot contact payment or image-deletion providers.
+  process.env.PAYSTACK_SECRET_KEY = "";
+  process.env.CLOUDINARY_API_SECRET = "";
+} else {
+  let serviceAccount;
+  try { serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || ""); }
+  catch (_) { throw new Error("FIREBASE_SERVICE_ACCOUNT must contain valid service-account JSON."); }
+  initializeApp({ credential: cert(serviceAccount) });
+}
+// Bound external calls and prevent demo sessions from touching real providers.
+async function providerFetch(url, options = {}) {
+  if (emulatorMode) throw new Error("External providers are disabled in emulator mode.");
+  return fetch(url, { ...options, signal: AbortSignal.timeout(15_000) });
+}
+const firebaseAuth = getAuth();
+const db = getFirestore();
 
 const app = express();
-const port = 4000;
-const resend = new Resend(process.env.RESEND_API_KEY);
+const port = Number(process.env.PORT || 4000);
+const resend = emulatorMode ? { emails: { send: async (payload) => {
+  const ref = db.collection("emulatorEmails").doc();
+  await ref.set({ ...payload, createdAt: FieldValue.serverTimestamp() });
+  return { data: { id: ref.id } };
+} } } : new Resend(process.env.RESEND_API_KEY);
 // Sender for all transactional email. Set MAIL_FROM to your verified Resend domain,
 // e.g. "Servrr <welcome@servrr.ng>". Falls back to the sandbox if unset (goes to spam).
 const MAIL_FROM = process.env.MAIL_FROM || "Servrr <onboarding@resend.dev>";
-const APP_URL = process.env.APP_URL || "https://servrr.ng";
-const db = admin.firestore();
-const { FieldValue } = admin.firestore;
+const APP_URL = emulatorMode ? "http://127.0.0.1:5174" : process.env.APP_URL || "https://servrr.ng";
 
 // Behind Render's proxy — needed for req.ip (rate limiting) to be the real client IP.
 app.set("trust proxy", 1);
@@ -54,6 +70,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .filter(Boolean);
 
 if (ALLOWED_ORIGINS.length === 0) {
+  if (process.env.NODE_ENV === "production") throw new Error("ALLOWED_ORIGINS is required in production.");
   console.warn(
     "[cors] ALLOWED_ORIGINS not set — allowing all origins. Set it to lock down CORS in production.",
   );
@@ -63,6 +80,7 @@ if (ALLOWED_ORIGINS.length === 0) {
 
 app.use(
   cors({
+    exposedHeaders: ["X-Request-Id"],
     origin(origin, cb) {
       // Non-browser / same-origin requests (no Origin header) are always allowed.
       if (!origin) return cb(null, true);
@@ -78,7 +96,7 @@ app.use(
 );
 
 app.use(express.json({
-  limit: "25mb",
+  limit: "256kb",
   verify: (req, _res, buffer) => {
     // Paystack signs the exact request bytes. Keep them before JSON parsing so
     // webhook verification is not affected by whitespace or key ordering.
@@ -86,10 +104,20 @@ app.use(express.json({
     if (requestPath === "/paystack-webhook") req.rawBody = buffer;
   },
 }));
-app.use(express.urlencoded({ limit: "25mb" }));
+app.use(express.urlencoded({ limit: "256kb", extended: false }));
 
 // Baseline security headers for API responses (the frontend's headers live in vercel.json).
 app.use((req, res, next) => {
+  req.requestId = /^[a-zA-Z0-9_-]{12,100}$/.test(req.headers["x-request-id"] || "")
+    ? req.headers["x-request-id"] : crypto.randomUUID();
+  res.setHeader("X-Request-Id", req.requestId);
+  const started = Date.now();
+  res.on("finish", () => {
+    if (process.env.NODE_ENV === "production" || res.statusCode >= 500) console.log(JSON.stringify({
+      event: "request", requestId: req.requestId, method: req.method, path: req.path,
+      status: res.statusCode, durationMs: Date.now() - started,
+    }));
+  });
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
@@ -167,9 +195,11 @@ const hasValidSessionToken = (session, token) => Boolean(token) &&
   Array.isArray(session.accessTokens) && session.accessTokens.some(
     (entry) => entry.hash === hashSessionAccessToken(token) && Number(entry.expiresAt) > Date.now(),
   );
-const hasCheckAccess = (session, checkId, secret) =>
-  !session.checks?.[checkId]?.secretHash ||
-  (validCheckSecret(secret) && hashCheckSecret(secret) === session.checks[checkId].secretHash);
+const hasCheckAccess = (session, checkId, secret) => {
+  if (!validCheckId(checkId) || !validCheckSecret(secret)) return false;
+  const state = session.checks?.[checkId];
+  return !state || Boolean(state.secretHash && hashCheckSecret(secret) === state.secretHash);
+};
 
 const createSessionAccessToken = () => crypto.randomBytes(32).toString("hex");
 const hashSessionAccessToken = (token) =>
@@ -200,6 +230,7 @@ const isVenueActive = (profile) => {
   if (!profile) return false;
   return profile.suspended !== true;
 };
+const isVenueAcceptingOrders = (profile) => isVenueActive(profile) && profile.servicePaused !== true;
 
 const requireFirebaseUser = async (req, res, next) => {
   const header = req.headers.authorization || "";
@@ -207,7 +238,14 @@ const requireFirebaseUser = async (req, res, next) => {
   if (!token) return res.status(401).json({ error: "Missing auth token" });
 
   try {
-    req.firebaseUser = await admin.auth().verifyIdToken(token);
+    req.firebaseUser = await firebaseAuth.verifyIdToken(token, true);
+    if (await isSuperAdmin(req.firebaseUser.uid)) {
+      const policy = await db.doc("platformSecurity/access").get();
+      const requireMfa = process.env.REQUIRE_SUPERADMIN_MFA === "true" || policy.data()?.requireSuperAdminMfa === true;
+      if (requireMfa && !req.firebaseUser.firebase?.sign_in_second_factor) {
+        return res.status(403).json({ error: "Sign in with your platform administrator's second factor." });
+      }
+    }
     return next();
   } catch (err) {
     console.error("Auth token verification failed:", err);
@@ -292,6 +330,8 @@ const userCanOperate = (uid, restaurantId) =>
 // Management only (mirrors canManageRestaurant) — owner/manager/admin.
 const userCanManage = (uid, restaurantId) =>
   hasRestaurantAccess(uid, restaurantId, MANAGE_ROLES);
+const userCanCollect = (uid, restaurantId) =>
+  hasRestaurantAccess(uid, restaurantId, [...MANAGE_ROLES, "cashier", "staff"]);
 
 // Billing must remain available while a workspace is awaiting its first
 // payment or recovering from a failed renewal. It therefore checks ownership
@@ -342,7 +382,7 @@ const destroyCloudinaryImage = async (publicId) => {
     api_key: apiKey,
     signature,
   });
-  const response = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/destroy`, {
+  const response = await providerFetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/destroy`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: form,
@@ -409,11 +449,14 @@ const validateOrderItems = (items) => {
   });
 };
 
-const calculateItemsTotal = (items) =>
-  items.reduce((sum, item) => sum + Number(item.price) * Number(item.qty), 0);
+const calculateItemsTotal = (items) => {
+  const kobo = items.reduce((sum, item) => sum + Math.round(Number(item.price) * 100) * Number(item.qty), 0);
+  if (!Number.isSafeInteger(kobo)) throw Object.assign(new Error("The order amount is outside the supported range."), { statusCode: 400 });
+  return kobo / 100;
+};
 
 const verifyPaystackReference = async (reference) => {
-  const paystackRes = await fetch(
+  const paystackRes = await providerFetch(
     `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
     {
       headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
@@ -487,12 +530,12 @@ const addSubscriptionPeriod = (value, cycle) => {
 // in Firebase's authorized domains yet.
 const genVerifyLink = async (email) => {
   try {
-    return await admin.auth().generateEmailVerificationLink(email, {
+    return await firebaseAuth.generateEmailVerificationLink(email, {
       url: `${APP_URL}/login`,
       handleCodeInApp: false,
     });
   } catch (_) {
-    return admin.auth().generateEmailVerificationLink(email);
+    return firebaseAuth.generateEmailVerificationLink(email);
   }
 };
 
@@ -617,7 +660,7 @@ app.post("/auth/request-otp", rateLimit({ windowMs: 15 * 60_000, max: 10 }), asy
     } else {
       // Keep the response generic so this endpoint cannot be used to enumerate accounts.
       try {
-        await admin.auth().getUserByEmail(email);
+        await firebaseAuth.getUserByEmail(email);
       } catch (_) {
         return res.json({ success: true, expiresInSeconds: EMAIL_OTP_TTL_MS / 1000 });
       }
@@ -625,7 +668,15 @@ app.post("/auth/request-otp", rateLimit({ windowMs: 15 * 60_000, max: 10 }), asy
 
     const code = createOtp();
     const now = Date.now();
-    await db.doc(`emailOtps/${otpDocumentId(purpose, email)}`).set({
+    const otpRef = db.doc(`emailOtps/${otpDocumentId(purpose, email)}`);
+    await db.runTransaction(async (tx) => {
+      const previous = await tx.get(otpRef);
+      const record = previous.exists ? previous.data() : {};
+      const sameWindow = now - toMillis(record.rateWindowStartedAt) < 15 * 60_000;
+      if (sameWindow && (Number(record.requestCount || 0) >= 10 || Number(record.windowAttempts || 0) >= 20)) {
+        throw Object.assign(new Error("Too many code requests or attempts. Please wait 15 minutes."), { statusCode: 429 });
+      }
+      tx.set(otpRef, {
       purpose,
       emailHash: hashValue(email),
       codeHash: hashValue(`${purpose}:${email}:${code}`),
@@ -635,12 +686,16 @@ app.post("/auth/request-otp", rateLimit({ windowMs: 15 * 60_000, max: 10 }), asy
       createdAt: FieldValue.serverTimestamp(),
       verifiedAt: null,
       verificationTokenHash: null,
+      rateWindowStartedAt: sameWindow ? record.rateWindowStartedAt : new Date(now),
+      requestCount: sameWindow ? Number(record.requestCount || 0) + 1 : 1,
+      windowAttempts: sameWindow ? Number(record.windowAttempts || 0) : 0,
+      });
     });
     await sendOtpEmail({ email, code, purpose });
     return res.json({ success: true, expiresInSeconds: EMAIL_OTP_TTL_MS / 1000 });
   } catch (err) {
     console.error("OTP request error:", err);
-    return res.status(500).json({ error: "Could not send a verification code. Please try again." });
+    return res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : "Could not send a verification code. Please try again." });
   }
 });
 
@@ -655,27 +710,30 @@ app.post("/auth/verify-otp", rateLimit({ windowMs: 15 * 60_000, max: 20 }), asyn
   try {
     const otpRef = db.doc(`emailOtps/${otpDocumentId(purpose, email)}`);
     const verificationToken = crypto.randomBytes(32).toString("hex");
-    await db.runTransaction(async (tx) => {
+    const result = await db.runTransaction(async (tx) => {
       const snap = await tx.get(otpRef);
       const record = snap.exists ? snap.data() : null;
       if (!record || isExpiredTimestamp(record.expiresAt)) {
         throw Object.assign(new Error("That code has expired. Request a new one."), { statusCode: 400 });
       }
-      if (Number(record.attempts || 0) >= EMAIL_OTP_MAX_ATTEMPTS) {
+      if (Number(record.attempts || 0) >= EMAIL_OTP_MAX_ATTEMPTS || Number(record.windowAttempts || 0) >= 20) {
         throw Object.assign(new Error("Too many incorrect attempts. Request a new code."), { statusCode: 429 });
       }
       if (record.codeHash !== hashValue(`${purpose}:${email}:${code}`)) {
-        tx.update(otpRef, { attempts: FieldValue.increment(1) });
-        throw Object.assign(new Error("That code is incorrect."), { statusCode: 400 });
+        tx.update(otpRef, { attempts: FieldValue.increment(1), windowAttempts: FieldValue.increment(1) });
+        return { incorrect: true };
       }
       tx.update(otpRef, {
         codeHash: null,
         attempts: FieldValue.increment(1),
+        windowAttempts: FieldValue.increment(1),
         verifiedAt: FieldValue.serverTimestamp(),
         verificationTokenHash: hashValue(verificationToken),
         verificationExpiresAt: new Date(Date.now() + EMAIL_OTP_TTL_MS),
       });
+      return { incorrect: false };
     });
+    if (result.incorrect) return res.status(400).json({ error: "That code is incorrect." });
     return res.json({ success: true, verificationToken });
   } catch (err) {
     return res.status(err.statusCode || 500).json({ error: err.message || "Could not verify that code." });
@@ -691,19 +749,22 @@ app.post("/auth/reset-password", rateLimit({ windowMs: 15 * 60_000, max: 10 }), 
   }
   try {
     const otpRef = db.doc(`emailOtps/${otpDocumentId("password_reset", email)}`);
-    const otpSnap = await otpRef.get();
-    const otp = otpSnap.exists ? otpSnap.data() : null;
-    if (!otp || otp.verificationTokenHash !== hashValue(verificationToken) || isExpiredTimestamp(otp.verificationExpiresAt)) {
-      return res.status(403).json({ error: "Verify a new email code before resetting your password." });
-    }
-    const user = await admin.auth().getUserByEmail(email);
-    await admin.auth().updateUser(user.uid, { password });
-    await admin.auth().revokeRefreshTokens(user.uid);
-    await otpRef.update({ verificationTokenHash: null, usedAt: FieldValue.serverTimestamp() });
+    await db.runTransaction(async (tx) => {
+      const otpSnap = await tx.get(otpRef);
+      const otp = otpSnap.exists ? otpSnap.data() : null;
+      if (!otp || otp.verificationTokenHash !== hashValue(verificationToken) || isExpiredTimestamp(otp.verificationExpiresAt)) {
+        throw Object.assign(new Error("Verify a new email code before resetting your password."), { statusCode: 403 });
+      }
+      tx.update(otpRef, { verificationTokenHash: null, usedAt: FieldValue.serverTimestamp() });
+    });
+    const user = await firebaseAuth.getUserByEmail(email);
+    await firebaseAuth.updateUser(user.uid, { password });
+    await firebaseAuth.revokeRefreshTokens(user.uid);
+    await db.doc(`users/${user.uid}`).set({ authValidAfter: Math.floor(Date.now() / 1000) }, { merge: true });
     return res.json({ success: true });
   } catch (err) {
     console.error("Password reset error:", err);
-    return res.status(500).json({ error: "Could not reset your password. Please try again." });
+    return res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : "Could not reset your password. Please try again." });
   }
 });
 
@@ -767,6 +828,11 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
       ]);
 
       if (userSnap.exists) {
+        const existing = userSnap.data();
+        if (existing.restaurantId === restaurantId && profileSnap.data()?.ownerUid === uid &&
+            (existing.emailVerifiedAt || req.firebaseUser.email_verified)) {
+          return { restaurantId, alreadyCompleted: true };
+        }
         throw Object.assign(
           new Error("This user already has a restaurant workspace."),
           { statusCode: 409 },
@@ -817,6 +883,7 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
         : DEFAULT_MONTHLY_FEES[selectedBusinessType];
 
       tx.set(userRef, {
+        emailVerifiedAt: FieldValue.serverTimestamp(),
         restaurantId,
         email,
         role: "owner",
@@ -865,7 +932,7 @@ app.post("/complete-signup", rateLimit({ windowMs: 15 * 60_000, max: 20 }), requ
     });
 
     // The OTP proves control of this email, so mark the Firebase account verified.
-    await admin.auth().updateUser(uid, { emailVerified: true });
+    await firebaseAuth.updateUser(uid, { emailVerified: true });
 
     return res.json({ success: true, ...result });
   } catch (err) {
@@ -1010,57 +1077,33 @@ app.post(
         return res.status(409).json({ error: "Restore the workspace profile before recovering its data." });
       }
 
-      // Deleting a Firestore parent document does not delete its subcollections.
-      // Scan those subcollections as well as the original root collections so
-      // data from an older restaurant ID can be recovered after the profile is
-      // recreated.
-      const [legacyMenu, legacyOrders, allMenu, allOrders, profiles, currentMenu, currentOrders] =
-        await Promise.all([
-          db.collection("menu").get(),
-          db.collection("orders").get(),
-          db.collectionGroup("menu").get(),
-          db.collectionGroup("orders").get(),
-          db.collectionGroup("profile").get(),
-          db.collection(`restaurants/${restaurantId}/menu`).get(),
-          db.collection(`restaurants/${restaurantId}/orders`).get(),
-        ]);
-
+      // Recovery is limited to explicitly owned source paths. Root records have
+      // no tenant ownership and can only be migrated by a platform administrator.
       const relatedRestaurantIds = new Set([restaurantId]);
-      const normalizedUserEmail = String(req.firebaseUser.email || "").trim().toLowerCase();
-      for (const profile of profiles.docs) {
-        const data = profile.data() || {};
-        const profileEmail = String(data.email || data.contactEmail || "").trim().toLowerCase();
-        if (data.ownerUid === uid || (normalizedUserEmail && profileEmail === normalizedUserEmail)) {
-          const parts = profile.ref.path.split("/");
-          if (parts[0] === "restaurants" && parts[2] === "profile") {
-            relatedRestaurantIds.add(parts[1]);
-          }
+      const ownedProfiles = await db.collectionGroup("profile").where("ownerUid", "==", uid).get();
+      for (const profile of ownedProfiles.docs) {
+        const parts = profile.ref.path.split("/");
+        if (parts[0] === "restaurants" && parts[2] === "profile" && parts[3] === "info") {
+          relatedRestaurantIds.add(parts[1]);
         }
       }
-
-      const sourceRecords = (rootSnapshot, groupSnapshot, collectionName) => {
-        const records = new Map();
-        for (const snapshot of rootSnapshot.docs) {
-          records.set(`${collectionName}/${snapshot.id}`, snapshot);
-        }
-        for (const snapshot of groupSnapshot.docs) {
-          const parts = snapshot.ref.path.split("/");
-          const sourceRestaurantId = parts[0] === "restaurants" ? parts[1] : null;
-          if (
-            sourceRestaurantId &&
-            parts[2] === collectionName &&
-            (relatedRestaurantIds.has(sourceRestaurantId) || snapshot.data()?.restaurantId === restaurantId)
-          ) {
-            records.set(snapshot.ref.path, snapshot);
-          }
-        }
-        return [...records.values()];
-      };
-
-      const legacyMenuRecords = sourceRecords(legacyMenu, allMenu, "menu");
-      const legacyOrderRecords = sourceRecords(legacyOrders, allOrders, "orders");
-      if (legacyMenuRecords.length === 0 && legacyOrderRecords.length === 0) {
-        return res.status(404).json({ error: "No legacy menu or transaction records were found." });
+      const sources = await Promise.all([...relatedRestaurantIds].map(async (sourceId) => {
+        const [menu, orders] = await Promise.all([
+          db.collection(`restaurants/${sourceId}/menu`).get(),
+          db.collection(`restaurants/${sourceId}/orders`).get(),
+        ]);
+        return { menu, orders, sourceId };
+      }));
+      const [legacyMenu, legacyOrders] = superAdmin
+        ? await Promise.all([db.collection("menu").get(), db.collection("orders").get()])
+        : [{ docs: [] }, { docs: [] }];
+      const current = sources.find((source) => source.sourceId === restaurantId);
+      const currentMenu = current.menu;
+      const currentOrders = current.orders;
+      const legacyMenuRecords = [...legacyMenu.docs, ...sources.flatMap((source) => source.menu.docs)];
+      const legacyOrderRecords = [...legacyOrders.docs, ...sources.flatMap((source) => source.orders.docs)];
+      if (!legacyMenuRecords.length && !legacyOrderRecords.length) {
+        return res.status(404).json({ error: "No owned historical records were found. Contact support for legacy migration." });
       }
 
       const currentMenuIds = new Set(currentMenu.docs.map((snapshot) => snapshot.id));
@@ -1147,7 +1190,7 @@ app.post(
 // GET /banks — fetch supported Nigerian banks from Paystack (always up-to-date codes)
 app.get("/banks", async (req, res) => {
   try {
-    const r = await fetch(
+    const r = await providerFetch(
       "https://api.paystack.co/bank?country=nigeria&type=nuban&currency=NGN&per_page=100",
       {
         headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
@@ -1181,7 +1224,7 @@ app.get("/resolve-account", rateLimit({ windowMs: 60_000, max: 30 }), requireFir
     return res.status(403).json({ error: "Not authorized for this restaurant" });
   }
   try {
-    const r = await fetch(
+    const r = await providerFetch(
       `https://api.paystack.co/bank/resolve?account_number=${encodeURIComponent(account_number)}&bank_code=${encodeURIComponent(bank_code)}`,
       {
         headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
@@ -1216,7 +1259,7 @@ app.post("/create-subaccount", rateLimit({ windowMs: 60_000, max: 10 }), require
     return res.status(403).json({ error: "Not authorized for this restaurant" });
   }
   try {
-    const r = await fetch("https://api.paystack.co/subaccount", {
+    const r = await providerFetch("https://api.paystack.co/subaccount", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
@@ -1269,7 +1312,7 @@ app.post("/subscription-checkout", requireFirebaseUser, async (req, res) => {
     if (!process.env.PAYSTACK_SECRET_KEY) {
       return res.status(503).json({ error: "Subscription billing is not configured yet. Please contact support." });
     }
-    const planResponse = await fetch(`https://api.paystack.co/plan/${encodeURIComponent(config.planCode)}`, {
+    const planResponse = await providerFetch(`https://api.paystack.co/plan/${encodeURIComponent(config.planCode)}`, {
       headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
     });
     const planPayload = await planResponse.json();
@@ -1291,7 +1334,7 @@ app.post("/subscription-checkout", requireFirebaseUser, async (req, res) => {
     }
     const billingEmail = normalizeEmail(req.firebaseUser.email || profile.email);
     if (!billingEmail) return res.status(400).json({ error: "A billing email is required." });
-    const response = await fetch("https://api.paystack.co/transaction/initialize", {
+    const response = await providerFetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
@@ -1367,7 +1410,7 @@ app.post("/subscription-manage-link", requireFirebaseUser, async (req, res) => {
     if (!subscriptionCode) {
       return res.status(404).json({ error: "No automatic subscription is connected yet." });
     }
-    const response = await fetch(
+    const response = await providerFetch(
       `https://api.paystack.co/subscription/${encodeURIComponent(subscriptionCode)}/manage/link`,
       { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } },
     );
@@ -1388,7 +1431,7 @@ app.post("/verify-payment", async (req, res) => {
     return res.status(400).json({ success: false, error: "Invalid reference" });
   }
   try {
-    const paystackRes = await fetch(
+    const paystackRes = await providerFetch(
       `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
       {
         headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` },
@@ -1714,35 +1757,20 @@ app.get("/table-tokens", requireFirebaseUser, async (req, res) => {
       return res.status(403).json({ error: "Not authorized for this restaurant" });
     }
 
-    const refs = Array.from({ length: count }, (_, i) =>
-      db.doc(`restaurants/${restaurantId}/tables/${i + 1}`),
-    );
-    const snaps = await db.getAll(...refs);
-
-    const tokens = {};
-    const batch = db.batch();
-    let mintedAny = false;
-    snaps.forEach((snap, i) => {
-      const table = i + 1;
-      if (snap.exists && snap.data().token) {
-        tokens[table] = snap.data().token;
-        return;
-      }
-      const newToken = crypto.randomBytes(16).toString("hex");
-      tokens[table] = newToken;
-      mintedAny = true;
-      batch.set(
-        snap.ref,
-        {
-          token: newToken,
-          currentSessionId: snap.exists ? snap.data().currentSessionId ?? null : null,
-          createdAt: snap.exists ? snap.data().createdAt : FieldValue.serverTimestamp(),
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true },
-      );
+    const refs = Array.from({ length: count }, (_, index) => db.doc(`restaurants/${restaurantId}/tables/${index + 1}`));
+    const tokens = await db.runTransaction(async (tx) => {
+      const snaps = await Promise.all(refs.map((ref) => tx.get(ref)));
+      const result = {};
+      snaps.forEach((snap, index) => {
+        const token = snap.data()?.token || crypto.randomBytes(16).toString("hex");
+        result[index + 1] = token;
+        if (!snap.data()?.token) tx.set(snap.ref, {
+          token, currentSessionId: snap.data()?.currentSessionId || null,
+          createdAt: snap.data()?.createdAt || FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      });
+      return result;
     });
-    if (mintedAny) await batch.commit();
 
     return res.json({ tokens });
   } catch (err) {
@@ -1784,76 +1812,30 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
       }
 
       const currentSessionId = tableSnap.data().currentSessionId || null;
-      let recycleSessionRef = null;
       if (currentSessionId) {
-        const sessionRef = db.doc(
-          `restaurants/${restaurantId}/tableSessions/${currentSessionId}`,
-        );
+        const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${currentSessionId}`);
         const sessionSnap = await tx.get(sessionRef);
-        if (
-          sessionSnap.exists &&
-          ["open", "awaiting_payment", "transfer_reported"].includes(sessionSnap.data().status)
-        ) {
+        if (sessionSnap.exists && OPEN_TABLE_SESSION_STATUSES.includes(sessionSnap.data().status)) {
           const session = sessionSnap.data();
           const lastActivity = toMillis(session.updatedAt || session.openedAt);
-          if (lastActivity && Date.now() - lastActivity > SESSION_IDLE_MS) {
-            tx.update(sessionRef, {
-              status: "expired",
-              expiredAt: FieldValue.serverTimestamp(),
-              expiredReason: "idle",
-              waiterCalledAt: null,
-            });
-          } else {
-
-          const accessTokens = Array.isArray(session.accessTokens)
-            ? session.accessTokens.filter((entry) => Number(entry.expiresAt) > Date.now())
-            : [];
-          accessTokens.push({ hash: accessTokenHash, expiresAt: accessTokenExpiresAt });
-          tx.update(sessionRef, { accessTokens: accessTokens.slice(-20) });
-
-          // Prepaid (pay-online) sessions have no staff-forced closing moment.
-          // If every order on the session has been served, the party is done —
-          // recycle: archive the old session and start fresh for the new scan.
-          // Otherwise the next party would inherit a stranger's session.
-          if (normalizePaymentMode(session.paymentMode) === "pay_online") {
-            const ids = Array.isArray(session.orderIds) ? session.orderIds : [];
-            if (ids.length > 0) {
-              const orderSnaps = await Promise.all(
-                ids.map((id) =>
-                  tx.get(db.doc(`restaurants/${restaurantId}/orders/${id}`)),
-                ),
-              );
-              // Cancelled orders are settled by definition — they never block recycling.
-              const allServed = orderSnaps.every(
-                (s) =>
-                  s.exists &&
-                  ["completed", "cancelled"].includes(s.data().status),
-              );
-              if (allServed) {
-                recycleSessionRef = sessionRef; // close below, then create anew
-              } else {
-                return { sessionId: currentSessionId, accessToken }; // party still eating — rejoin
-              }
-            } else {
-              return { sessionId: currentSessionId, accessToken }; // fresh prepaid session, nothing ordered yet
-            }
-          } else {
-            return { sessionId: currentSessionId, accessToken }; // pay-at-table: staff closing is the boundary
+          const orderSnaps = await Promise.all((session.orderIds || []).map((id) =>
+            tx.get(db.doc(`restaurants/${restaurantId}/orders/${id}`))));
+          // Missing financial history is never evidence that a visit is empty.
+          const hasObligations = orderSnaps.some((snap) => !snap.exists ||
+            (snap.data().status !== "cancelled" &&
+             (snap.data().paymentStatus !== "paid" || !["served", "completed"].includes(snap.data().status))));
+          const idle = lastActivity && Date.now() - lastActivity > SESSION_IDLE_MS;
+          if (!idle || hasObligations) {
+            const accessTokens = (session.accessTokens || []).filter((entry) => Number(entry.expiresAt) > Date.now());
+            accessTokens.push({ hash: accessTokenHash, expiresAt: accessTokenExpiresAt });
+            tx.update(sessionRef, { accessTokens: accessTokens.slice(-100) });
+            return { sessionId: currentSessionId, accessToken };
           }
-          }
+          tx.update(sessionRef, { status: "expired", expiredAt: FieldValue.serverTimestamp(), expiredReason: "empty_idle_visit", waiterCalledAt: null });
         }
       }
 
-      if (recycleSessionRef) {
-        tx.update(recycleSessionRef, {
-          status: "paid",
-          paidVia: "online",
-          closedAt: FieldValue.serverTimestamp(),
-          closedByUid: null,
-          waiterCalledAt: null,
-        });
-      }
-
+      if (profileSnap.data()?.servicePaused) throw Object.assign(new Error("This venue has paused new ordering. Ask staff for help."), { statusCode: 403 });
       const paymentMode = normalizePaymentMode(profileSnap.data()?.paymentMode);
 
       const newSessionRef = db
@@ -1893,6 +1875,71 @@ app.post("/open-table-session", rateLimit({ windowMs: 60_000, max: 60 }), async 
 // POST /place-order — server-authoritative pay-at-table order creation.
 // The client supplies the cart, but the server owns prices, totals, and the
 // atomic append to the table session.
+app.post("/guest-session", rateLimit({ windowMs: 60_000, max: 1200 }), async (req, res) => {
+  const { restaurantId, sessionId, checkId, checkSecret, accessToken, orderId } = req.body || {};
+  res.setHeader("Cache-Control", "no-store");
+  if (!/^[a-z0-9-]{2,80}$/.test(String(restaurantId || "")) ||
+      !/^[a-zA-Z0-9_-]{1,120}$/.test(String(sessionId || ""))) {
+    return res.status(400).json({ error: "A valid visit is required." });
+  }
+  try {
+    const sessionSnap = await db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`).get();
+    if (!sessionSnap.exists || !canReadGuestCheck(sessionSnap.data(), checkId, checkSecret, accessToken)) {
+      return res.status(403).json({ error: "Open this bill in the browser you ordered from, or ask staff for help." });
+    }
+    const session = sessionSnap.data();
+    const orderSnap = await db.collection(`restaurants/${restaurantId}/orders`)
+      .where("sessionId", "==", sessionId).where("checkId", "==", checkId).get();
+    const orders = orderSnap.docs.map((snap) => ({ id: snap.id, ...snap.data() }));
+    const order = orderId ? orders.find((entry) => entry.id === orderId) : null;
+    if (orderId && !order) return res.status(404).json({ error: "This order is not part of your bill." });
+    const view = (currentSession, currentOrders) => toWire({
+      session: guestSessionView(sessionId, currentSession, checkId, currentOrders),
+      orders: currentOrders,
+      order: orderId ? currentOrders.find((entry) => entry.id === orderId) : null,
+      complete: ["paid", "closed"].includes(currentSession.status) && currentOrders.every((entry) =>
+        entry.status === "cancelled" || (entry.paymentStatus === "paid" && ["served", "completed"].includes(entry.status))),
+    });
+    if (!String(req.headers.accept || "").includes("text/event-stream")) return res.json(view(session, orders));
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-store, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+    let currentSession = session;
+    let currentOrders = orders;
+    let stopped = false;
+    const listeners = [];
+    const heartbeat = setInterval(() => { if (!stopped) res.write(": keepalive\n\n"); }, 25000);
+    const cleanup = () => { stopped = true; clearInterval(heartbeat); listeners.forEach((unsubscribe) => unsubscribe()); };
+    res.on("close", cleanup);
+    const fail = (message, status = 503) => {
+      if (!stopped) { res.write(`data: ${JSON.stringify({ error: message, status })}\n\n`); res.end(); cleanup(); }
+    };
+    const send = () => {
+      if (stopped) return;
+      if (!canReadGuestCheck(currentSession, checkId, checkSecret, accessToken)) return fail("This bill is no longer available to this browser.", 403);
+      if (orderId && !currentOrders.some((entry) => entry.id === orderId)) return fail("This order is no longer part of your bill.", 404);
+      const payload = view(currentSession, currentOrders);
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      if (payload.complete) { res.end(); cleanup(); }
+    };
+    send();
+    if (stopped) return undefined;
+    listeners.push(db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`).onSnapshot((snap) => {
+      if (!snap.exists) return fail("This visit is no longer available.", 404);
+      currentSession = snap.data(); send();
+    }, () => fail("Updates are temporarily unavailable. Reconnecting…")));
+    listeners.push(db.collection(`restaurants/${restaurantId}/orders`)
+      .where("sessionId", "==", sessionId).where("checkId", "==", checkId).onSnapshot((snap) => {
+        currentOrders = snap.docs.map((entry) => ({ id: entry.id, ...entry.data() })); send();
+      }, () => fail("Updates are temporarily unavailable. Reconnecting…")));
+    return undefined;
+  } catch (err) {
+    console.error("Guest visit read failed:", err);
+    return res.status(500).json({ error: "Could not update your visit. Please try again." });
+  }
+});
+
 app.post("/place-order", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
   const restaurantId = String(req.body?.restaurantId || "").trim();
   const sessionId = String(req.body?.sessionId || "").trim();
@@ -1902,10 +1949,12 @@ app.post("/place-order", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
   const table = String(req.body?.table || "").trim();
   const allergies = String(req.body?.allergies || "").trim().slice(0, 500);
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  const requestId = String(req.body?.requestId || "").trim();
   const requestedCheckId = String(req.body?.checkId || "");
   const checkSecret = String(req.body?.checkSecret || "");
 
   if (!restaurantId || !sessionId || !accessToken || !customerName || !table ||
+      !/^[a-zA-Z0-9_-]{12,120}$/.test(requestId) ||
       !validCheckId(requestedCheckId) || !validCheckSecret(checkSecret)) {
     return res.status(400).json({ error: "A valid table session, name, and table are required." });
   }
@@ -1914,9 +1963,27 @@ app.post("/place-order", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
   }
 
   try {
+    const fingerprint = hashValue(JSON.stringify({ sessionId, checkId: requestedCheckId, customerName, email, table, allergies,
+      items: items.map((item) => ({ id: item.id || null, name: item.name, qty: Number(item.qty) })) }));
     const result = await db.runTransaction(async (tx) => {
+      const requestRef = db.doc(`restaurants/${restaurantId}/guestOrderRequests/${requestedCheckId}_${requestId}`);
+      const existing = await tx.get(requestRef);
+      if (existing.exists) {
+        const prior = existing.data();
+        if (prior.secretHash !== hashCheckSecret(checkSecret) || prior.sessionId !== sessionId) {
+          throw Object.assign(new Error("This submission belongs to another visit."), { statusCode: 403 });
+        }
+        if (prior.fingerprint !== fingerprint) {
+          throw Object.assign(new Error("The previous selection was already submitted. Check your bill before changing it."), { statusCode: 409 });
+        }
+        return { orderId: prior.orderId, total: prior.total, duplicate: true };
+      }
       const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
       const sessionSnap = await tx.get(sessionRef);
+      const profileSnap = await tx.get(db.doc(`restaurants/${restaurantId}/profile/info`));
+      if (!isVenueAcceptingOrders(profileSnap.data())) {
+        throw Object.assign(new Error("This venue is not accepting orders right now."), { statusCode: 403 });
+      }
       if (!sessionSnap.exists) {
         throw Object.assign(new Error("Table session not found."), { statusCode: 404 });
       }
@@ -1938,21 +2005,7 @@ app.post("/place-order", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
         throw Object.assign(new Error("This check belongs to another guest."), { statusCode: 403 });
       }
 
-      const menuSnap = await tx.get(db.collection(`restaurants/${restaurantId}/menu`));
-      const menuByName = new Map(
-        menuSnap.docs.map((doc) => [String(doc.data().name || "").trim(), doc.data()]),
-      );
-      const verifiedItems = items.map((item) => {
-        const menuItem = menuByName.get(String(item.name || "").trim());
-        if (!menuItem || menuItem.available === false) {
-          throw Object.assign(new Error(`${item.name || "An item"} is no longer available.`), { statusCode: 409 });
-        }
-        const price = Number(menuItem.price);
-        if (!Number.isFinite(price)) {
-          throw Object.assign(new Error("A menu item has an invalid price."), { statusCode: 500 });
-        }
-        return { name: String(menuItem.name), price, qty: Number(item.qty) };
-      });
+      const verifiedItems = await verifiedMenuItems(tx, db, restaurantId, items);
       const total = calculateItemsTotal(verifiedItems);
       const orderRef = db.collection(`restaurants/${restaurantId}/orders`).doc();
       tx.set(orderRef, {
@@ -1973,7 +2026,8 @@ app.post("/place-order", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
         checks: { ...(session.checks || {}), [requestedCheckId]: { status: "open", secretHash: hashCheckSecret(checkSecret) } },
         updatedAt: FieldValue.serverTimestamp(),
       });
-      return { orderId: orderRef.id };
+      tx.create(requestRef, { orderId: orderRef.id, sessionId, fingerprint, secretHash: hashCheckSecret(checkSecret), total, createdAt: FieldValue.serverTimestamp() });
+      return { orderId: orderRef.id, total };
     });
     return res.json({ success: true, ...result });
   } catch (err) {
@@ -2033,7 +2087,7 @@ app.post(
         if (requestSnap.exists) {
           return { ...requestSnap.data(), duplicate: true };
         }
-        if (!profileSnap.exists || !isVenueActive(profileSnap.data())) {
+        if (!profileSnap.exists || !isVenueAcceptingOrders(profileSnap.data())) {
           throw Object.assign(new Error("This restaurant is not accepting orders right now."), {
             statusCode: 403,
           });
@@ -2064,36 +2118,7 @@ app.post(
           }
         }
 
-        const menuSnap = await tx.get(
-          db.collection(`restaurants/${restaurantId}/menu`),
-        );
-        const menuByName = new Map(
-          menuSnap.docs.map((menuDoc) => [
-            String(menuDoc.data().name || "").trim(),
-            menuDoc.data(),
-          ]),
-        );
-        const verifiedItems = items.map((item) => {
-          const menuItem = menuByName.get(String(item.name || "").trim());
-          if (!menuItem || menuItem.available === false) {
-            throw Object.assign(
-              new Error(`${item.name || "An item"} is no longer available.`),
-              { statusCode: 409 },
-            );
-          }
-          const price = Number(menuItem.price);
-          if (!Number.isFinite(price)) {
-            throw Object.assign(new Error("A menu item has an invalid price."), {
-              statusCode: 500,
-            });
-          }
-          return {
-            name: String(menuItem.name),
-            price,
-            qty: Number(item.qty),
-            station: menuItem.station === "bar" ? "bar" : "kitchen",
-          };
-        });
+        const verifiedItems = await verifiedMenuItems(tx, db, restaurantId, items);
 
         if (!sessionRef) {
           sessionRef = db.collection(`restaurants/${restaurantId}/tableSessions`).doc();
@@ -2201,10 +2226,9 @@ app.post("/edit-order", rateLimit({ windowMs: 60_000, max: 20 }), async (req, re
     const result = await db.runTransaction(async (tx) => {
       const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
       const orderRef = db.doc(`restaurants/${restaurantId}/orders/${orderId}`);
-      const [sessionSnap, orderSnap, menuSnap] = await Promise.all([
+      const [sessionSnap, orderSnap] = await Promise.all([
         tx.get(sessionRef),
         tx.get(orderRef),
-        tx.get(db.collection(`restaurants/${restaurantId}/menu`)),
       ]);
       const session = sessionSnap.data();
       const tokenHash = hashSessionAccessToken(accessToken);
@@ -2222,14 +2246,7 @@ app.post("/edit-order", rateLimit({ windowMs: 60_000, max: 20 }), async (req, re
           checkState(session, orderCheckId(order)).status !== "open") {
         throw Object.assign(new Error("This order can no longer be edited."), { statusCode: 409 });
       }
-      const menuByName = new Map(menuSnap.docs.map((doc) => [String(doc.data().name || "").trim(), doc.data()]));
-      const verifiedItems = items.map((item) => {
-        const menuItem = menuByName.get(String(item.name || "").trim());
-        if (!menuItem || menuItem.available === false) {
-          throw Object.assign(new Error(`${item.name || "An item"} is no longer available.`), { statusCode: 409 });
-        }
-        return { name: String(menuItem.name), price: Number(menuItem.price), qty: Number(item.qty) };
-      });
+      const verifiedItems = await verifiedMenuItems(tx, db, restaurantId, items);
       const nextTotal = calculateItemsTotal(verifiedItems);
       tx.update(orderRef, { items: verifiedItems, total: nextTotal, updatedAt: FieldValue.serverTimestamp() });
       tx.update(sessionRef, {
@@ -2370,12 +2387,12 @@ app.post("/group-payment-sharing", rateLimit({ windowMs: 60_000, max: 20 }), asy
   }
 });
 
-app.get("/shared-table-bills", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
-  const restaurantId = String(req.query.restaurantId || "").trim();
-  const sessionId = String(req.query.sessionId || "").trim();
-  const orderId = String(req.query.orderId || "").trim();
-  const accessToken = String(req.query.accessToken || "").trim();
-  const checkSecret = String(req.query.checkSecret || "");
+app.post("/shared-table-bills", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const sessionId = String(req.body?.sessionId || "").trim();
+  const orderId = String(req.body?.orderId || "").trim();
+  const accessToken = String(req.body?.accessToken || "").trim();
+  const checkSecret = String(req.body?.checkSecret || "");
   if (!restaurantId || !sessionId || !orderId || !accessToken) {
     return res.status(400).json({ error: "A valid order and table session are required." });
   }
@@ -2521,14 +2538,14 @@ app.post("/request-bill", async (req, res) => {
   }
 });
 
-// GET /transfer-details — return bank details only for an active bill session.
+// POST /transfer-details — return bank details only for an active bill session.
 // Full account numbers never live in the public restaurant profile.
-app.get("/transfer-details", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
-  const restaurantId = String(req.query.restaurantId || "").trim();
-  const sessionId = String(req.query.sessionId || "").trim();
-  const orderId = String(req.query.orderId || "").trim();
-  const accessToken = String(req.query.accessToken || "").trim();
-  const checkSecret = String(req.query.checkSecret || "");
+app.post("/transfer-details", rateLimit({ windowMs: 60_000, max: 30 }), async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const sessionId = String(req.body?.sessionId || "").trim();
+  const orderId = String(req.body?.orderId || "").trim();
+  const accessToken = String(req.body?.accessToken || "").trim();
+  const checkSecret = String(req.body?.checkSecret || "");
   if (!restaurantId || !sessionId || !orderId || !accessToken) {
     return res.status(400).json({ error: "A valid order and table session are required." });
   }
@@ -2657,6 +2674,10 @@ app.post("/call-waiter", rateLimit({ windowMs: 60_000, max: 30 }), async (req, r
         throw Object.assign(new Error("Table session not found."), { statusCode: 404 });
       }
       const session = sessionSnap.data();
+      const { checkId, checkSecret, accessToken } = req.body || {};
+      if (!hasValidSessionToken(session, accessToken) || !session.checks?.[checkId] || !hasCheckAccess(session, checkId, checkSecret)) {
+        throw Object.assign(new Error("Valid guest access is required."), { statusCode: 403 });
+      }
       if (!["open", "awaiting_payment"].includes(session.status)) {
         throw Object.assign(new Error("This table's session is closed."), { statusCode: 409 });
       }
@@ -2770,7 +2791,7 @@ app.post("/cancel-table-order", requireFirebaseUser, async (req, res) => {
     return res.status(400).json({ error: "A restaurant and order are required." });
   }
   try {
-    if (!(await userCanOperate(req.firebaseUser.uid, restaurantId))) {
+    if (!(await userCanCollect(req.firebaseUser.uid, restaurantId))) {
       return res.status(403).json({ error: "Not authorised for this restaurant." });
     }
     const result = await db.runTransaction(async (tx) => {
@@ -2900,6 +2921,30 @@ app.post("/mark-order-served", requireFirebaseUser, async (req, res) => {
 
 // Staff may collect one check or all outstanding checks together. Each order is
 // marked paid exactly once. Service can finish before or after collection.
+app.get("/pending-transfers", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.query.restaurantId || "").trim();
+  try {
+    if (!restaurantId || !(await userCanManage(req.firebaseUser.uid, restaurantId))) {
+      return res.status(403).json({ error: "Not authorised for this restaurant." });
+    }
+    const sessions = await db.collection(`restaurants/${restaurantId}/tableSessions`)
+      .where("status", "in", OPEN_TABLE_SESSION_STATUSES).get();
+    const totals = { count: 0, total: 0 };
+    for (const snap of sessions.docs) {
+      const session = snap.data();
+      if (session.status !== "transfer_reported" && !Object.values(session.checks || {}).some((check) => check.status === "transfer_reported")) continue;
+      const orders = await Promise.all((session.orderIds || []).map((id) => db.doc(`restaurants/${restaurantId}/orders/${id}`).get()));
+      const pending = pendingTransferTotals(session, orders.filter((order) => order.exists).map((order) => order.data()));
+      totals.count += pending.count;
+      totals.total += pending.total;
+    }
+    return res.json(totals);
+  } catch (err) {
+    console.error("Pending transfer read failed:", err);
+    return res.status(500).json({ error: "Could not load pending transfers." });
+  }
+});
+
 app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
   const restaurantId = String(req.body?.restaurantId || "").trim();
   const sessionId = String(req.body?.sessionId || "").trim();
@@ -2912,10 +2957,15 @@ app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
     return res.status(400).json({ error: "Select a valid bill and payment method." });
   }
   try {
-    if (!(await userCanOperate(req.firebaseUser.uid, restaurantId))) {
+    if (!(await userCanCollect(req.firebaseUser.uid, restaurantId))) {
       return res.status(403).json({ error: "Not authorised for this restaurant." });
     }
+    const settlementKey = hashValue(JSON.stringify([sessionId, paidVia, [...orderIds].sort(), [...checkIds].sort()]));
+    const settlementRef = db.doc(`restaurants/${restaurantId}/settlements/s_${settlementKey}`);
+    const paidAt = new Date();
     const receipt = await db.runTransaction(async (tx) => {
+      const priorPayment = await tx.get(settlementRef);
+      if (priorPayment.exists) return priorPayment.data().receipt;
       const sessionRef = db.doc(`restaurants/${restaurantId}/tableSessions/${sessionId}`);
       const sessionSnap = await tx.get(sessionRef);
       if (!sessionSnap.exists || !OPEN_TABLE_SESSION_STATUSES.includes(sessionSnap.data().status)) {
@@ -2976,15 +3026,16 @@ app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
         const selectedForCheck = selected.filter((snap) => orderCheckId(snap.data()) === id);
         const checkAmount = selectedForCheck
           .reduce((sum, snap) => sum + Number(snap.data().total || 0), 0);
-        // Legacy orders share one fallback check state. Do not mark that state
-        // paid while another guest's legacy bill is still outstanding.
-        if (selectedForCheck.length === unpaidForCheck.length) {
-          checks[id] = { ...checkState(session, id), status: "paid", paidVia, paidAt: new Date(), amount: checkAmount,
-            settledOrders: selectedForCheck.length };
-        }
+        const prior = checkState(session, id);
+        const fullyPaid = selectedForCheck.length === unpaidForCheck.length;
+        const methods = new Set([prior.paidVia, paidVia].filter(Boolean));
+        checks[id] = { ...prior, ...(fullyPaid ? { status: "paid" } : {}),
+          paidVia: methods.size > 1 ? "mixed" : paidVia, paidAt,
+          amount: Number(prior.amount || 0) + checkAmount,
+          settledOrders: Number(prior.settledOrders || 0) + selectedForCheck.length };
       });
       selected.forEach((snap) => tx.update(snap.ref, {
-        paymentStatus: "paid", paidVia, paidAt: FieldValue.serverTimestamp(),
+        paymentStatus: "paid", paidVia, paidAt: FieldValue.serverTimestamp(), settlementId: settlementRef.id,
         ...(snap.data().status === "served" ? { status: "completed" } : {}),
       }));
       tx.update(sessionRef, {
@@ -3012,7 +3063,8 @@ app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
         lastSettlementAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
-      return {
+      const receiptData = {
+        settlementId: settlementRef.id,
         restaurantName: profileSnap.data()?.name || restaurantId,
         table: session.table,
         orders: selected.map((snap) => ({
@@ -3024,8 +3076,17 @@ app.post("/settle-checks", requireFirebaseUser, async (req, res) => {
         settledOrderIds: selected.map((snap) => snap.id),
         paidVia,
         tableClosed,
-        closedAt: new Date().toISOString(),
+        closedAt: paidAt.toISOString(),
       };
+      tx.create(settlementRef, {
+        sessionId, table: session.table, orderIds: selected.map((snap) => snap.id),
+        checkIds: selectedCheckIds, amount, paidVia, paidAt,
+        dateKey: lagosDayKey(paidAt), actorUid: req.firebaseUser.uid, receipt: receiptData,
+        recipients: [...new Set(selected.map((snap) => snap.data().email).filter(Boolean))],
+        receiptOrders: selected.map((snap) => ({ customerName: snap.data().customerName || "Guest",
+          email: snap.data().email || "", items: snap.data().items || [], total: Number(snap.data().total || 0) })),
+      });
+      return receiptData;
     });
     return res.json({ success: true, ...receipt });
   } catch (err) {
@@ -3135,7 +3196,7 @@ app.post("/move-order-check", requireFirebaseUser, async (req, res) => {
       }
       tx.update(orderRef, { checkId: targetCheckId, updatedAt: FieldValue.serverTimestamp() });
       tx.update(sessionRef, {
-        checks: { ...(session.checks || {}), [targetCheckId]: { status: "open" } },
+        checks: { ...(session.checks || {}), [targetCheckId]: { ...checkState(session, targetCheckId), status: "open" } },
         updatedAt: FieldValue.serverTimestamp(),
       });
     });
@@ -3168,72 +3229,40 @@ app.post("/rebuild-daily-summaries", requireFirebaseUser, async (req, res) => {
       return res.status(403).json({ error: "Not authorized for this restaurant" });
     }
 
-    const start = new Date();
-    start.setDate(start.getDate() - (days - 1));
-    start.setHours(0, 0, 0, 0);
-    const sessionCollection = db.collection(`restaurants/${restaurantId}/tableSessions`);
-    const [closedSessions, updatedSessions] = await Promise.all([
-      sessionCollection.where("closedAt", ">=", start).get(),
-      sessionCollection.where("updatedAt", ">=", start).get(),
-    ]);
-    const sessions = new Map([...closedSessions.docs, ...updatedSessions.docs].map((snap) => [snap.id, snap]));
-    const totals = new Map();
-    const summaryFor = (dayKey) => {
-      if (!totals.has(dayKey)) totals.set(dayKey, {
-        totalRevenue: 0, cashRevenue: 0, posRevenue: 0, transferRevenue: 0,
-        onlineRevenue: 0, otherRevenue: 0, settledTables: 0, settledOrders: 0,
-      });
-      return totals.get(dayKey);
-    };
-
-    sessions.forEach((snap) => {
-      const session = snap.data();
-      const paidChecks = Object.values(session.checks || {}).filter((check) =>
-        check.status === "paid" && Number.isFinite(Number(check.amount)));
-      if (paidChecks.length) {
-        paidChecks.filter((check) => toMillis(check.paidAt) >= start.getTime()).forEach((check) => {
-          const current = summaryFor(lagosDayKey(toMillis(check.paidAt)));
-          current.totalRevenue += Number(check.amount);
-          current[paymentRevenueField(check.paidVia)] += Number(check.amount);
-          current.settledOrders += Number(check.settledOrders || 0);
-        });
-        if (session.status === "paid" && toMillis(session.closedAt) >= start.getTime()) {
-          summaryFor(lagosDayKey(toMillis(session.closedAt))).settledTables += 1;
+    const endKey = lagosDayKey();
+    const endDate = new Date(`${endKey}T12:00:00+01:00`);
+    let summariesUpdated = 0;
+    let lockedDaysSkipped = 0;
+    for (let index = 0; index < days; index++) {
+      const date = new Date(endDate.getTime() - index * 86400000);
+      const key = lagosDayKey(date);
+      const start = new Date(`${key}T00:00:00+01:00`);
+      const end = new Date(start.getTime() + 86400000);
+      const rebuilt = await db.runTransaction(async (tx) => {
+        const summaryRef = db.doc(`restaurants/${restaurantId}/dailySummaries/${key}`);
+        const summary = await tx.get(summaryRef);
+        if (summary.data()?.reconciledAt) return false;
+        // Reading the summary in this transaction serializes rebuild with any
+        // settlement increment, so a concurrent collection cannot be overwritten.
+        const [events, paidOrders, closedSessions] = await Promise.all([
+          tx.get(db.collection(`restaurants/${restaurantId}/settlements`).where("paidAt", ">=", start).where("paidAt", "<", end)),
+          tx.get(db.collection(`restaurants/${restaurantId}/orders`).where("paidAt", ">=", start).where("paidAt", "<", end)),
+          tx.get(db.collection(`restaurants/${restaurantId}/tableSessions`).where("closedAt", ">=", start).where("closedAt", "<", end)),
+        ]);
+        const totals = summarizePayments(events.docs.map((snap) => snap.data()),
+          paidOrders.docs.map((snap) => ({ id: snap.id, ...snap.data() })), closedSessions.docs.map((snap) => snap.data()));
+        if (Number(summary.data()?.totalRevenue || 0) > totals.totalRevenue + 0.005) {
+          throw Object.assign(new Error("Historical payment records are incomplete. Existing revenue was left unchanged; reconcile the missing records before rebuilding."), { statusCode: 409 });
         }
-        return;
-      }
-      if (session.status !== "paid" || toMillis(session.closedAt) < start.getTime()) return;
-      const total = Number(session.totalBill);
-      if (!Number.isFinite(total) || total < 0) return;
-      const current = summaryFor(lagosDayKey(toMillis(session.closedAt)));
-      current.totalRevenue += total;
-      current[paymentRevenueField(session.paidVia)] += total;
-      current.settledTables += 1;
-      current.settledOrders += Array.isArray(session.orderIds) ? session.orderIds.length : 0;
-    });
-
-    const writes = [...totals.entries()];
-    for (let index = 0; index < writes.length; index += 450) {
-      const batch = db.batch();
-      writes.slice(index, index + 450).forEach(([dayKey, data]) => {
-        batch.set(
-          db.doc(`restaurants/${restaurantId}/dailySummaries/${dayKey}`),
-          {
-            dateKey: dayKey,
-            ...data,
-            rebuiltAt: FieldValue.serverTimestamp(),
-            updatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true },
-        );
+        tx.set(summaryRef, { dateKey: key, ...totals, rebuiltAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+        return true;
       });
-      await batch.commit();
+      if (rebuilt) summariesUpdated++; else lockedDaysSkipped++;
     }
-
-    return res.json({ success: true, days, summariesUpdated: writes.length });
+    return res.json({ success: true, days, summariesUpdated, lockedDaysSkipped });
   } catch (err) {
     console.error("Rebuild daily summaries error:", err);
-    return res.status(500).json({ error: "Could not rebuild daily summaries." });
+    return res.status(err.statusCode || 500).json({ error: err.statusCode ? err.message : "Could not rebuild daily summaries." });
   }
 });
 
@@ -3497,6 +3526,63 @@ app.post("/finalize-online-payment", rateLimit({ windowMs: 60_000, max: 30 }), a
   }
 });
 
+// Named staff logins coexist with legacy shared screens during migration.
+app.get("/staff-accounts", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.query.restaurantId || "").trim();
+  try {
+    if (!(await userCanManage(req.firebaseUser.uid, restaurantId))) return res.status(403).json({ error: "Management access is required." });
+    const users = await db.collection("users").where("restaurantId", "==", restaurantId).get();
+    return res.json({ accounts: users.docs.filter((snap) => snap.data().accountType === "individual_staff")
+      .map((snap) => ({ uid: snap.id, name: snap.data().displayName, email: snap.data().email, role: snap.data().role })) });
+  } catch (_) { return res.status(500).json({ error: "Could not load staff access." }); }
+});
+
+app.post("/staff-accounts", rateLimit({ windowMs: 60000, max: 10 }), requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const name = String(req.body?.name || "").trim().slice(0, 80);
+  const role = String(req.body?.role || "");
+  if (!name || !["kitchen", "bar", "waiter", "cashier"].includes(role)) return res.status(400).json({ error: "Choose a staff name and a service role." });
+  try {
+    if (!(await userCanManage(req.firebaseUser.uid, restaurantId))) return res.status(403).json({ error: "Management access is required." });
+    const tempPassword = genTempPassword();
+    const email = `${restaurantId}.${crypto.randomBytes(8).toString("hex")}@staff.servrr.ng`;
+    const user = await firebaseAuth.createUser({ email, password: tempPassword, displayName: name, emailVerified: true });
+    await db.doc(`users/${user.uid}`).set({ restaurantId, email, displayName: name, role, accountType: "individual_staff", createdAt: FieldValue.serverTimestamp() });
+    return res.json({ success: true, uid: user.uid, email, tempPassword });
+  } catch (_) { return res.status(500).json({ error: "Could not finish staff setup. Check the account list before retrying." }); }
+});
+
+const individualStaffTarget = async (restaurantId, uid) => {
+  const snap = await db.doc(`users/${uid}`).get();
+  return snap.exists && snap.data().restaurantId === restaurantId && snap.data().accountType === "individual_staff" ? snap.data() : null;
+};
+app.post("/reset-staff-account", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const uid = String(req.body?.uid || "").trim();
+  try {
+    if (!(await userCanManage(req.firebaseUser.uid, restaurantId))) return res.status(403).json({ error: "Management access is required." });
+    const target = await individualStaffTarget(restaurantId, uid);
+    if (!target) return res.status(404).json({ error: "Staff account not found." });
+    const tempPassword = genTempPassword();
+    await firebaseAuth.updateUser(uid, { password: tempPassword });
+    await firebaseAuth.revokeRefreshTokens(uid);
+    await db.doc(`users/${uid}`).update({ authValidAfter: Math.floor(Date.now() / 1000) });
+    return res.json({ success: true, email: target.email, tempPassword });
+  } catch (_) { return res.status(500).json({ error: "Could not reset staff access." }); }
+});
+app.delete("/staff-account", requireFirebaseUser, async (req, res) => {
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const uid = String(req.body?.uid || "").trim();
+  try {
+    if (!(await userCanManage(req.firebaseUser.uid, restaurantId))) return res.status(403).json({ error: "Management access is required." });
+    if (!(await individualStaffTarget(restaurantId, uid))) return res.status(404).json({ error: "Staff account not found." });
+    // Remove authorization first. A failed Auth cleanup cannot leave venue access.
+    await db.doc(`users/${uid}`).delete();
+    await firebaseAuth.deleteUser(uid);
+    return res.json({ success: true });
+  } catch (_) { return res.status(500).json({ error: "Could not finish removing staff access. Please retry." }); }
+});
+
 // DELETE /delete-user — permanently delete a Firebase Auth account (super admin only)
 app.delete("/delete-user", requireFirebaseUser, async (req, res) => {
   if (!(await isSuperAdmin(req.firebaseUser.uid))) {
@@ -3505,7 +3591,7 @@ app.delete("/delete-user", requireFirebaseUser, async (req, res) => {
   const { uid } = req.body;
   if (!uid) return res.status(400).json({ error: "uid required" });
   try {
-    await admin.auth().deleteUser(uid);
+    await firebaseAuth.deleteUser(uid);
     res.json({ success: true });
   } catch (err) {
     console.error("Delete user error:", err);
@@ -3570,7 +3656,7 @@ app.post(
           .json({ error: "A staff login already exists. Reset or remove it instead." });
       }
       const tempPassword = genTempPassword();
-      const userRecord = await admin.auth().createUser({
+      const userRecord = await firebaseAuth.createUser({
         email: cleanedEmail,
         password: tempPassword,
         emailVerified: true, // vouched for by the owner — no separate verification step
@@ -3607,9 +3693,10 @@ app.post("/reset-staff-password", requireFirebaseUser, async (req, res) => {
     const staff = await findStaffLogin(restaurantId);
     if (!staff) return res.status(404).json({ error: "No staff login to reset." });
     const tempPassword = genTempPassword();
-    await admin.auth().updateUser(staff.uid, { password: tempPassword });
+    await firebaseAuth.updateUser(staff.uid, { password: tempPassword });
     // Kill any live sessions too (e.g. a stolen tablet) — not just future logins.
-    await admin.auth().revokeRefreshTokens(staff.uid).catch(() => {});
+    await firebaseAuth.revokeRefreshTokens(staff.uid);
+    await db.doc(`users/${staff.uid}`).set({ authValidAfter: Math.floor(Date.now() / 1000) }, { merge: true });
     return res.json({ success: true, email: staff.email || "", tempPassword });
   } catch (err) {
     console.error("Reset staff password error:", err);
@@ -3628,7 +3715,7 @@ app.delete("/delete-staff", requireFirebaseUser, async (req, res) => {
     const staff = await findStaffLogin(restaurantId);
     if (!staff) return res.status(404).json({ error: "No staff login to remove." });
     await db.doc(`users/${staff.uid}`).delete();
-    await admin.auth().deleteUser(staff.uid).catch(() => {});
+    await firebaseAuth.deleteUser(staff.uid).catch(() => {});
     return res.json({ success: true });
   } catch (err) {
     console.error("Delete staff error:", err);
@@ -3664,7 +3751,7 @@ app.post(
 
       // Staff logins alert the owner (they own the credential); others alert themselves.
       let to = req.firebaseUser.email || userData.email || "";
-      const isStaff = userData.role === "staff";
+      const isStaff = ["staff", "kitchen", "bar", "waiter", "cashier"].includes(userData.role);
       if (isStaff && userData.restaurantId) {
         const profSnap = await db
           .doc(`restaurants/${userData.restaurantId}/profile/info`)
@@ -3720,80 +3807,44 @@ app.post(
   },
 );
 
-// POST /send-receipt — email the full bill to the customer(s) when the table is closed (staff only)
+// Receipt contents and recipients come only from committed payment records.
 app.post("/send-receipt", rateLimit({ windowMs: 60_000, max: 20 }), requireFirebaseUser, async (req, res) => {
-  const { restaurantId, emails, restaurantName, table, orders, totalBill } = req.body;
-  const cleanedRestaurantId = String(restaurantId || "").trim();
-  if (!cleanedRestaurantId) {
-    return res.status(400).json({ error: "restaurantId is required" });
+  const restaurantId = String(req.body?.restaurantId || "").trim();
+  const settlementId = String(req.body?.settlementId || "").trim();
+  if (!restaurantId || !/^s_[a-f0-9]{64}$/.test(settlementId)) {
+    return res.status(400).json({ error: "A recorded settlement is required." });
   }
-  if (!Array.isArray(emails) || !emails.length) {
-    return res.status(400).json({ error: "No email addresses provided" });
-  }
-  if (!(await userCanOperate(req.firebaseUser.uid, cleanedRestaurantId))) {
-    return res.status(403).json({ error: "Not authorized for this restaurant" });
-  }
-
-  const safeOrders = Array.isArray(orders) ? orders : [];
-  const itemsHtml = safeOrders
-    .map((order) => {
-      const rows = (order.items || [])
-        .map(
-          (item) => `
-        <tr>
-          <td style="padding:6px 0;color:#aaa;font-size:13px;">${Number(item.qty) || 0}× ${escapeHtml(item.name)}</td>
-          <td style="padding:6px 0;text-align:right;color:#aaa;font-size:13px;">₦${(parseFloat(item.price) * Number(item.qty) || 0).toLocaleString()}</td>
-        </tr>`,
-        )
-        .join("");
-      const header =
-        safeOrders.length > 1
-          ? `<p style="color:#666;font-size:11px;margin:0 0 8px 0;text-transform:uppercase;letter-spacing:1px;">${escapeHtml(order.customerName)}'s order</p>`
-          : "";
-      return `
-      <div style="margin-bottom:16px;">
-        ${header}
-        <table style="width:100%;border-collapse:collapse;">
-          ${rows}
-          <tr>
-            <td style="padding:8px 0;border-top:1px solid #333;color:#666;font-size:12px;">Subtotal</td>
-            <td style="padding:8px 0;border-top:1px solid #333;text-align:right;color:#fff;font-size:13px;font-weight:bold;">₦${Number(order.total || 0).toLocaleString()}</td>
-          </tr>
-        </table>
-      </div>`;
-    })
-    .join(
-      '<hr style="border:none;border-top:1px solid #222;margin:16px 0;" />',
-    );
-
-  const html = `
-    <div style="background:#0a0a0a;font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;">
-      <h1 style="color:#fff;font-size:22px;font-weight:900;margin:0 0 4px 0;">${escapeHtml(restaurantName)}</h1>
-      <p style="color:#555;font-size:13px;margin:0 0 32px 0;">Table ${escapeHtml(table)} · Receipt</p>
-      <div style="background:#111;border:1px solid #222;padding:20px;margin-bottom:16px;">${itemsHtml}</div>
-      <div style="background:#111;border:1px solid #333;padding:16px 20px;display:flex;justify-content:space-between;align-items:center;">
-        <span style="color:#666;font-size:14px;text-transform:uppercase;letter-spacing:1px;">Total</span>
-        <span style="color:#fff;font-size:22px;font-weight:900;">₦${Number(totalBill).toLocaleString()}</span>
-      </div>
-      <p style="color:#333;font-size:12px;text-align:center;margin-top:32px;">Thank you for dining with us!</p>
-    </div>`;
-
   try {
-    await resend.emails.send({
-      from: MAIL_FROM,
-      to: emails,
-      subject: `Your receipt from ${restaurantName} — Table ${table}`,
-      html,
-    });
-    res.json({ success: true });
+    if (!(await userCanCollect(req.firebaseUser.uid, restaurantId))) {
+      return res.status(403).json({ error: "Not authorised for this restaurant." });
+    }
+    const snapshot = await db.doc(`restaurants/${restaurantId}/settlements/${settlementId}`).get();
+    if (!snapshot.exists) return res.status(404).json({ error: "Payment record not found." });
+    const payment = snapshot.data();
+    const receipts = receiptsForSettlement(payment);
+    for (const receipt of receipts) {
+      const result = await resend.emails.send({
+        from: MAIL_FROM, to: [receipt.email],
+        subject: `Your receipt from ${payment.receipt.restaurantName} — Table ${payment.table}`,
+        html: receiptHtml(payment, receipt),
+      }, { idempotencyKey: `${settlementId}-${hashValue(receipt.email)}` });
+      if (result.error) throw new Error(result.error.message || "Email provider rejected the receipt.");
+    }
+    return res.json({ success: true, sent: receipts.length });
   } catch (err) {
     console.error("Receipt email error:", err);
-    res.status(500).json({ error: "Failed to send email" });
+    return res.status(500).json({ error: "Could not send the recorded receipt. Please retry." });
   }
 });
 
 // Lightweight health check (replaces the old unauthenticated email relay).
 app.get("/", (req, res) => res.json({ status: "ok" }));
+app.get("/ready", async (_req, res) => {
+  try {
+    await db.doc("platformHealth/readiness").get();
+    return res.json({ status: "ready", database: "reachable" });
+  } catch (_) { return res.status(503).json({ status: "unavailable" }); }
+});
 
 app.listen(port, () => {
   console.log(`Server listening at http://localhost:${port}`);
